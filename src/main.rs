@@ -112,7 +112,7 @@ fn reward_text(issue: &Issue) -> String {
     issue
         .reward
         .as_ref()
-        .map(|r| format!("{} {}.{:02}", r.currency, r.cents / 100, r.cents % 100))
+        .map(|r| format!("{} {}", r.currency, r.amount_text()))
         .unwrap_or_else(|| "Reward no longer stated".into())
 }
 
@@ -257,7 +257,7 @@ impl eframe::App for App {
                         &self.currency
                     })
                     .show_ui(ui, |ui| {
-                        for currency in ["", "USD", "EUR", "GBP", "$"] {
+                        for currency in ["", "USD", "EUR", "GBP", "CAD", "AUD", "NZD", "CHF", "$", "USDC", "USDT", "SOL", "ETH", "BTC"] {
                             ui.selectable_value(
                                 &mut self.currency,
                                 currency.into(),
@@ -368,7 +368,7 @@ impl eframe::App for App {
                         && (self.currency.is_empty()
                             || issue.reward.as_ref().is_some_and(|r| {
                                 r.currency == self.currency
-                                    && r.cents >= u64::from(self.minimum) * 100
+                                    && r.scaled() >= u128::from(self.minimum) * model::Reward::SCALE
                             }))
                         && (query.is_empty()
                             || issue.title.to_lowercase().contains(&query)
@@ -390,7 +390,7 @@ impl eframe::App for App {
                     (Some(a), Some(b)) => a
                         .currency
                         .cmp(&b.currency)
-                        .then_with(|| b.cents.cmp(&a.cents)),
+                        .then_with(|| b.scaled().cmp(&a.scaled())),
                     (Some(_), None) => std::cmp::Ordering::Less,
                     (None, Some(_)) => std::cmp::Ordering::Greater,
                     _ => std::cmp::Ordering::Equal,

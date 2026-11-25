@@ -30,7 +30,38 @@ impl Forge {
 pub struct Reward {
     pub currency: String,
     pub cents: u64,
+    #[serde(default)]
+    pub crypto_decimal: Option<String>,
     pub evidence: String,
+}
+
+impl Reward {
+    pub const SCALE: u128 = 1_000_000_000_000_000_000;
+
+    pub fn scaled(&self) -> u128 {
+        self.crypto_decimal
+            .as_deref()
+            .and_then(decimal_units)
+            .unwrap_or(u128::from(self.cents) * (Self::SCALE / 100))
+    }
+
+    pub fn amount_text(&self) -> String {
+        self.crypto_decimal
+            .clone()
+            .unwrap_or_else(|| format!("{}.{:02}", self.cents / 100, self.cents % 100))
+    }
+}
+
+fn decimal_units(text: &str) -> Option<u128> {
+    let (whole, fraction) = text.split_once('.').unwrap_or((text, ""));
+    let whole = whole.parse::<u128>().ok()?.checked_mul(Reward::SCALE)?;
+    let places = 18_u32.checked_sub(fraction.len().try_into().ok()?)?;
+    let fraction = if fraction.is_empty() {
+        0
+    } else {
+        fraction.parse::<u128>().ok()?
+    };
+    whole.checked_add(fraction.checked_mul(10_u128.pow(places))?)
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -107,10 +138,10 @@ static DECLARATION: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?i)^(?:bounty(?: amount)?|cash reward|reward|payout|paid issue|prize|compensation)(?:\s*[:=–—]\s*|\s*-\s+|\s+|$)").unwrap()
 });
 static AMOUNT: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)^(?:(US\$|CA\$|AU\$|NZ\$|\$|USD|EUR|GBP|CAD|AUD|NZD|CHF|€|£)\s*)?((?:[0-9]{1,9}|[0-9]{1,3}(?:,[0-9]{3}){1,2})(?:\.[0-9]{1,2})?)\s*(USD|EUR|GBP|CAD|AUD|NZD|CHF)?$").unwrap()
+    Regex::new(r"(?i)^(?:(US\$|CA\$|AU\$|NZ\$|\$|USD|EUR|GBP|CAD|AUD|NZD|CHF|USDC|USDT|SOL|ETH|BTC|€|£)\s*)?((?:[0-9]{1,9}|[0-9]{1,3}(?:,[0-9]{3}){1,2})(?:\.[0-9]{1,18})?)\s*(USD|EUR|GBP|CAD|AUD|NZD|CHF|USDC|USDT|SOL|ETH|BTC)?$").unwrap()
 });
 static AMOUNT_FIRST: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)^((?:[0-9$€£+-]|(?:US|CA|AU|NZ)\$|(?:USD|EUR|GBP|CAD|AUD|NZD|CHF)\b).+?)\s+(?:bounty|reward|payout)$").unwrap()
+    Regex::new(r"(?i)^((?:[0-9$€£+-]|(?:US|CA|AU|NZ)\$|(?:USD|EUR|GBP|CAD|AUD|NZD|CHF|USDC|USDT|SOL|ETH|BTC)\b).+?)\s+(?:bounty|reward|payout)$").unwrap()
 });
 
 #[derive(Debug, PartialEq)]
@@ -129,7 +160,7 @@ impl RewardEvidence {
     }
 }
 
-fn parse_amount(text: &str) -> Option<(&'static str, u64)> {
+fn parse_amount(text: &str) -> Option<(&'static str, u64, Option<String>)> {
     let m = AMOUNT.captures(text)?;
     let currency = |text: &str| match text.to_ascii_uppercase().as_str() {
         "US$" | "USD" => "USD",
@@ -139,6 +170,11 @@ fn parse_amount(text: &str) -> Option<(&'static str, u64)> {
         "AU$" | "AUD" => "AUD",
         "NZ$" | "NZD" => "NZD",
         "CHF" => "CHF",
+        "USDC" => "USDC",
+        "USDT" => "USDT",
+        "SOL" => "SOL",
+        "ETH" => "ETH",
+        "BTC" => "BTC",
         _ => "$",
     };
     let prefix = m.get(1).map(|v| currency(v.as_str()));
@@ -151,6 +187,12 @@ fn parse_amount(text: &str) -> Option<(&'static str, u64)> {
     };
     let amount = m[2].replace(',', "");
     let (whole, fraction) = amount.split_once('.').unwrap_or((&amount, ""));
+    if matches!(currency, "USDC" | "USDT" | "SOL" | "ETH" | "BTC") {
+        return (decimal_units(&amount)? > 0).then_some((currency, 0, Some(amount)));
+    }
+    if fraction.len() > 2 {
+        return None;
+    }
     let fraction = match fraction.len() {
         0 => 0,
         1 => fraction.parse::<u64>().ok()? * 10,
@@ -161,7 +203,7 @@ fn parse_amount(text: &str) -> Option<(&'static str, u64)> {
         .ok()?
         .checked_mul(100)?
         .checked_add(fraction)?;
-    (cents != 0).then_some((currency, cents))
+    (cents != 0).then_some((currency, cents, None))
 }
 
 fn declaration(line: &str) -> Option<String> {
@@ -225,7 +267,7 @@ pub fn reward_evidence(title: &str, body: &str, labels: &[String]) -> RewardEvid
         let Some(amount) = declaration(line) else {
             continue;
         };
-        let Some((currency, cents)) = parse_amount(&amount) else {
+        let Some((currency, cents, crypto_decimal)) = parse_amount(&amount) else {
             if amount.bytes().any(|c| c.is_ascii_digit()) {
                 if line == title
                     && title_offer.is_some_and(|offer| {
@@ -238,17 +280,18 @@ pub fn reward_evidence(title: &str, body: &str, labels: &[String]) -> RewardEvid
             }
             continue;
         };
-        if result
-            .as_ref()
-            .is_some_and(|r| r.cents != cents || r.currency != currency)
-        {
-            return RewardEvidence::Ambiguous;
-        }
-        result = Some(Reward {
+        let reward = Reward {
             currency: currency.into(),
             cents,
+            crypto_decimal,
             evidence: line.trim().into(),
-        });
+        };
+        if result.as_ref().is_some_and(|previous| {
+            previous.currency != currency || previous.scaled() != reward.scaled()
+        }) {
+            return RewardEvidence::Ambiguous;
+        }
+        result = Some(reward);
     }
     result.map_or(RewardEvidence::Missing, RewardEvidence::Stated)
 }
@@ -401,6 +444,19 @@ mod tests {
                 .cents,
             5000
         );
+    }
+
+    #[test]
+    fn keeps_crypto_precision_and_rejects_alternatives() {
+        let parsed = reward("Bounty: 0.000000000000000001 ETH", "", &[]).unwrap();
+        assert_eq!(parsed.scaled(), 1);
+        assert_eq!(parsed.amount_text(), "0.000000000000000001");
+        assert_eq!(
+            reward("Bounty: 120.50 USDC", "", &[]).unwrap().currency,
+            "USDC"
+        );
+        assert!(reward("Bounty: 0.5 BTC or 8 SOL", "", &[]).is_none());
+        assert!(reward("Bounty: USD 1.001", "", &[]).is_none());
     }
 
     #[test]
