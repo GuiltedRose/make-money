@@ -405,7 +405,9 @@ impl Session<'_> {
             .repositories
             .get(&self.forge)
             .map_or(0, |repos| repos.len());
-        let catalog_state = if progress.catalog_next.is_some() {
+        let catalog_state = if progress.catalog_limited {
+            "provider catalog limit or incomplete catalog response"
+        } else if progress.catalog_next.is_some() {
             "catalog continuation saved"
         } else if catalog_pages == 0 {
             "catalog not advanced"
@@ -449,15 +451,18 @@ impl Session<'_> {
         let repositories = self.cache.repositories.entry(self.forge).or_default();
         for entry in entries {
             if let Some((path, activity)) = public_repository(self.forge, entry) {
+                let provider_id = entry["id"].as_u64();
                 repositories
                     .entry(path.clone())
                     .and_modify(|repo| {
+                        repo.provider_id = provider_id.or(repo.provider_id);
                         if activity > repo.activity {
                             repo.activity = activity.clone();
                         }
                     })
                     .or_insert_with(|| PublicRepository {
                         path,
+                        provider_id,
                         activity,
                         added_at: now,
                         ..PublicRepository::default()
@@ -467,6 +472,11 @@ impl Session<'_> {
         if !head_only {
             let progress = self.cache.progress.entry(self.forge).or_default();
             progress.catalog_day = next.as_ref().map(|_| day);
+            progress.catalog_limited = self.forge == Forge::GitHub
+                && (value["incomplete_results"].as_bool() == Some(true)
+                    || value["total_count"]
+                        .as_u64()
+                        .is_some_and(|total| total > 1000));
             progress.catalog_next = next.map(Into::into);
         }
         Ok(())
@@ -478,7 +488,7 @@ impl Session<'_> {
         seen: &mut HashSet<String>,
         counts: &mut DiscoveryCounts,
     ) -> Result<()> {
-        let base = repository_issues(self.forge, &repo.path)?;
+        let base = repository_issues(self.forge, &repo.path, repo.provider_id)?;
         let url = repo
             .issue_next
             .as_deref()
@@ -598,13 +608,12 @@ impl Session<'_> {
             let result = self.get(url.clone(), if watching { None } else { token.as_deref() });
             let (mut value, headers) = match result {
                 Ok(Some(page)) => page,
-                result if self.forge == Forge::GitLab && global_unavailable(&result) => {
+                result if self.forge != Forge::Codeberg && global_unavailable(&result) => {
                     return self.discover_public_repositories(
                         SEARCH_REQUESTS_PER_CYCLE - pass - 1,
-                        "GitLab global issue search unavailable",
+                        "global issue search unavailable",
                     );
                 }
-
                 result
                     if self.forge == Forge::Codeberg
                         && !watching
@@ -780,7 +789,11 @@ impl Session<'_> {
         let mode = if let Some(reason) = watch_reason {
             format!("Watchlist fallback ({reason})")
         } else {
-            "Site-wide search".into()
+            if token.is_none() {
+                "Anonymous site-wide search".into()
+            } else {
+                "Authenticated site-wide search".into()
+            }
         };
         Ok(format!("{mode} · {counts}{coverage}"))
     }
@@ -807,67 +820,118 @@ fn select_repository<'a>(
         })
 }
 
-fn repository_catalog(forge: Forge, _day: u64) -> Result<Url> {
-    ensure!(
-        forge == Forge::GitLab,
-        "public repository catalog unavailable"
-    );
-    let mut url = api(forge, &["projects"]);
-    url.query_pairs_mut()
-        .append_pair("page", "1")
-        .append_pair("per_page", &PAGE.to_string())
-        .append_pair("visibility", "public")
-        .append_pair("archived", "false")
-        .append_pair("with_issues_enabled", "true")
-        .append_pair("order_by", "last_activity_at")
-        .append_pair("sort", "desc");
-    Ok(url)
+fn repository_catalog(forge: Forge, day: u64) -> Result<Url> {
+    match forge {
+        Forge::GitHub => {
+            let mut url = api(forge, &["search", "repositories"]);
+            url.query_pairs_mut()
+                .append_pair("page", "1")
+                .append_pair("per_page", &GITHUB_PAGE_SIZE.to_string())
+                .append_pair(
+                    "q",
+                    &format!(
+                        "is:public archived:false pushed:>={}",
+                        utc_date(day.saturating_sub(30))
+                    ),
+                )
+                .append_pair("sort", "updated")
+                .append_pair("order", "desc");
+            Ok(url)
+        }
+        Forge::GitLab => {
+            let mut url = api(forge, &["projects"]);
+            url.query_pairs_mut()
+                .append_pair("page", "1")
+                .append_pair("per_page", &PAGE.to_string())
+                .append_pair("visibility", "public")
+                .append_pair("archived", "false")
+                .append_pair("with_issues_enabled", "true")
+                .append_pair("order_by", "last_activity_at")
+                .append_pair("sort", "desc");
+            Ok(url)
+        }
+        Forge::Codeberg => Err(anyhow!("public repository catalog unavailable")),
+    }
 }
 
-fn repository_issues(forge: Forge, path: &str) -> Result<Url> {
+fn repository_issues(forge: Forge, path: &str, provider_id: Option<u64>) -> Result<Url> {
     ensure!(
         storage::valid_path(path) && path.contains('/'),
         "invalid public repository path"
     );
-    ensure!(
-        forge == Forge::GitLab,
-        "public repository issues unavailable"
-    );
-    let mut url = api(forge, &["projects", path, "issues"]);
-    url.query_pairs_mut()
-        .append_pair("page", "1")
-        .append_pair("per_page", &PAGE.to_string())
-        .append_pair("state", "opened")
-        .append_pair("order_by", "updated_at")
-        .append_pair("sort", "desc");
-    Ok(url)
+    match forge {
+        Forge::GitHub => {
+            let id = provider_id
+                .context("GitHub repository ID missing")?
+                .to_string();
+            let mut url = api(forge, &["repositories", &id, "issues"]);
+            url.query_pairs_mut()
+                .append_pair("page", "1")
+                .append_pair("per_page", &PAGE.to_string())
+                .append_pair("state", "open")
+                .append_pair("sort", "updated")
+                .append_pair("direction", "desc");
+            Ok(url)
+        }
+        Forge::GitLab => {
+            let mut url = api(forge, &["projects", path, "issues"]);
+            url.query_pairs_mut()
+                .append_pair("page", "1")
+                .append_pair("per_page", &PAGE.to_string())
+                .append_pair("state", "opened")
+                .append_pair("order_by", "updated_at")
+                .append_pair("sort", "desc");
+            Ok(url)
+        }
+        Forge::Codeberg => Err(anyhow!("public repository issues unavailable")),
+    }
 }
 
-fn catalog_entries(_forge: Forge, value: &Value) -> Result<&Vec<Value>> {
-    value.as_array().context("expected public repository array")
+fn catalog_entries(forge: Forge, value: &Value) -> Result<&Vec<Value>> {
+    let entries = if forge == Forge::GitHub {
+        &value["items"]
+    } else {
+        value
+    };
+    entries
+        .as_array()
+        .context("expected public repository array")
 }
 
 fn public_repository(forge: Forge, entry: &Value) -> Option<(String, String)> {
-    if forge != Forge::GitLab
-        || entry["archived"].as_bool() == Some(true)
-        || entry["visibility"]
-            .as_str()
-            .is_some_and(|visibility| visibility != "public")
-        || entry["issues_enabled"].as_bool() == Some(false)
-    {
+    if entry["archived"].as_bool() == Some(true) {
         return None;
     }
-    let path = entry["path_with_namespace"].as_str()?;
+    let (path, activity) = match forge {
+        Forge::GitHub
+            if entry["private"].as_bool() == Some(false)
+                && entry["has_issues"].as_bool() != Some(false)
+                && entry["id"].as_u64().is_some() =>
+        {
+            (entry["full_name"].as_str()?, entry["pushed_at"].as_str())
+        }
+        Forge::GitLab
+            if entry["visibility"]
+                .as_str()
+                .is_none_or(|visibility| visibility == "public")
+                && entry["issues_enabled"].as_bool() != Some(false) =>
+        {
+            (
+                entry["path_with_namespace"].as_str()?,
+                entry["last_activity_at"].as_str(),
+            )
+        }
+        _ => return None,
+    };
     if !storage::valid_path(path) || !path.contains('/') {
         return None;
     }
-    let activity = entry["last_activity_at"].as_str().unwrap_or_default();
-    Some((path.into(), activity.into()))
+    Some((path.into(), activity.unwrap_or_default().into()))
 }
 
 fn request_bucket(forge: Forge, url: &Url, authenticated: bool) -> &'static str {
     match forge {
-        Forge::GitHub if url.path() == "/search/issues" => "search",
+        Forge::GitHub if url.path().starts_with("/search/") => "search",
         Forge::GitHub => "core",
         Forge::GitLab if authenticated => "authenticated",
         Forge::GitLab => "anonymous",
@@ -1164,7 +1228,8 @@ fn page_number(url: &Url) -> Result<usize> {
 
 fn next_page(forge: Forge, base: &Url, current: &Url, headers: &HeaderMap) -> Result<Option<Url>> {
     let current_page = page_number(current)?;
-    if forge == Forge::GitHub && current_page >= GITHUB_MAX_PAGE {
+    let github_search = forge == Forge::GitHub && base.path().starts_with("/search/");
+    if github_search && current_page >= GITHUB_MAX_PAGE {
         return Ok(None);
     }
     for link in headers.get_all("link").iter() {
@@ -1185,7 +1250,7 @@ fn next_page(forge: Forge, base: &Url, current: &Url, headers: &HeaderMap) -> Re
                 let target = checked_page_url(base, target)?;
                 let page = page_number(&target)?;
                 ensure!(page > current_page, "pagination did not advance");
-                return Ok((forge != Forge::GitHub || page <= GITHUB_MAX_PAGE).then_some(target));
+                return Ok((!github_search || page <= GITHUB_MAX_PAGE).then_some(target));
             }
         }
     }
@@ -1440,6 +1505,46 @@ mod tests {
     use super::*;
 
     #[test]
+    fn github_anonymous_repository_fallback_uses_separate_quota_and_pagination() {
+        let catalog = repository_catalog(Forge::GitHub, 40).unwrap();
+        assert_eq!(catalog.path(), "/search/repositories");
+        assert_eq!(request_bucket(Forge::GitHub, &catalog, false), "search");
+        assert!(
+            catalog
+                .query_pairs()
+                .any(|(k, v)| k == "q" && v.contains("is:public") && v.contains("pushed:>="))
+        );
+        let public = serde_json::json!({"full_name":"owner/project","id":18,"private":false,"pushed_at":"2026-01-01"});
+        assert_eq!(
+            public_repository(Forge::GitHub, &public).unwrap().0,
+            "owner/project"
+        );
+        assert!(
+            public_repository(
+                Forge::GitHub,
+                &serde_json::json!({"full_name":"owner/project","id":18,"private":true})
+            )
+            .is_none()
+        );
+        let base = repository_issues(Forge::GitHub, "owner/project", Some(18)).unwrap();
+        assert_eq!(base.path(), "/repositories/18/issues");
+        assert_eq!(request_bucket(Forge::GitHub, &base, false), "core");
+        let mut current = base.clone();
+        set_query_pair(&mut current, "page", "10");
+        let mut following = base.clone();
+        set_query_pair(&mut following, "page", "11");
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "link",
+            format!("<{following}>; rel=\"next\"").parse().unwrap(),
+        );
+        assert_eq!(
+            next_page(Forge::GitHub, &base, &current, &headers).unwrap(),
+            Some(following)
+        );
+    }
+
+    #[test]
     fn gitlab_anonymous_public_catalog_and_nested_project_issues() {
         let catalog = repository_catalog(Forge::GitLab, 0).unwrap();
         assert_eq!(catalog.path(), "/api/v4/projects");
@@ -1453,7 +1558,7 @@ mod tests {
             public_repository(Forge::GitLab, &project).unwrap().0,
             "group/sub/project"
         );
-        let issues = repository_issues(Forge::GitLab, "group/sub/project").unwrap();
+        let issues = repository_issues(Forge::GitLab, "group/sub/project", None).unwrap();
         assert_eq!(
             issues.path(),
             "/api/v4/projects/group%2Fsub%2Fproject/issues"

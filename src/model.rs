@@ -364,12 +364,16 @@ pub struct SearchProgress {
     pub catalog_next: Option<String>,
     #[serde(default)]
     pub catalog_day: Option<u64>,
+    #[serde(default)]
+    pub catalog_limited: bool,
     pub blocked_ranges: BTreeMap<String, bool>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct PublicRepository {
     pub path: String,
+    #[serde(default)]
+    pub provider_id: Option<u64>,
     pub activity: String,
     pub added_at: u64,
     pub scanned_at: u64,
