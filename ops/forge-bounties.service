@@ -1,0 +1,11 @@
+[Unit]
+Description=Refresh the Forge Bounties desktop cache
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/forge-bounties --sync
+EnvironmentFile=-%h/.config/forge-bounties/credentials.env
+TimeoutStartSec=22min
+UMask=0077
+NoNewPrivileges=yes

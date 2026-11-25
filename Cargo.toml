@@ -1,0 +1,17 @@
+[package]
+name = "forge-bounties"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.89"
+license = "BSD-3-Clause"
+
+[dependencies]
+anyhow = "1"
+eframe = { version = "0.33.3", default-features = false, features = ["default_fonts", "glow", "wayland", "x11"] }
+egui_commonmark = { version = "0.22.0", default-features = false }
+httpdate = "1"
+regex = "1"
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
+rusqlite = { version = "0.37", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

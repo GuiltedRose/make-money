@@ -1,0 +1,7 @@
+[Desktop Entry]
+Type=Application
+Name=Forge Bounties
+Comment=Browse cached programming bounties
+Exec=forge-bounties
+Terminal=false
+Categories=Development;
