@@ -19,6 +19,9 @@ use std::{
 
 const PAGE: usize = 20;
 const SEARCH_REQUESTS_PER_CYCLE: usize = 6;
+const RECENT_REQUESTS_PER_CYCLE: usize = 3;
+const GITLAB_HISTORY_PAGE: usize = 9;
+const GITLAB_RECENT_PAGE: usize = 3;
 const GITHUB_PAGE_SIZE: usize = 100;
 const GITHUB_MAX_PAGE: usize = 1000 / GITHUB_PAGE_SIZE;
 const CHECKS: usize = 8;
@@ -44,6 +47,15 @@ fn discovery_terms(forge: Forge) -> &'static [&'static str] {
         GITHUB_TERMS
     } else {
         &TERMS
+    }
+}
+
+fn recent_term(terms: &[&'static str], pass: usize, cursor: usize) -> (&'static str, usize) {
+    if pass == 0 {
+        (terms[0], cursor)
+    } else {
+        let index = cursor % (terms.len() - 1);
+        (terms[index + 1], index + 1)
     }
 }
 
@@ -343,33 +355,47 @@ impl Session<'_> {
         let mut seen = HashSet::new();
         let mut completed = HashSet::new();
         let terms = discovery_terms(self.forge);
-        let mut term_index =
-            self.cache.progress.entry(self.forge).or_default().next_term % terms.len();
+        let progress = self.cache.progress.entry(self.forge).or_default();
+        let mut term_index = progress.next_term % terms.len();
+        let mut recent_index = progress.next_recent;
+        let today = model::now() / DAY;
 
-        for _ in 0..SEARCH_REQUESTS_PER_CYCLE {
-            for _ in 0..terms.len() {
-                if !completed.contains(terms[term_index]) {
+        for pass in 0..SEARCH_REQUESTS_PER_CYCLE {
+            let recent = pass < RECENT_REQUESTS_PER_CYCLE;
+            let term = if recent {
+                let (term, next) = recent_term(terms, pass, recent_index);
+                recent_index = next;
+                term
+            } else {
+                while completed.len() < terms.len() && completed.contains(terms[term_index]) {
+                    term_index = (term_index + 1) % terms.len();
+                }
+                if completed.len() == terms.len() {
                     break;
                 }
+                let term = terms[term_index];
                 term_index = (term_index + 1) % terms.len();
-            }
-            if completed.len() == terms.len() {
-                break;
-            }
-            let term = terms[term_index];
-            term_index = (term_index + 1) % terms.len();
+                term
+            };
             let progress = self.cache.progress.entry(self.forge).or_default();
-            let task = progress
-                .terms
-                .get(term)
-                .and_then(|queue| queue.last())
-                .cloned()
-                .unwrap_or_default();
-            let base = search(self.forge, term, 1, task.range);
-            let url = if let Some(raw) = &task.next_url {
-                checked_page_url(&base, raw)?
+            let task = if recent {
+                SearchPage::default()
             } else {
-                base.clone()
+                progress
+                    .terms
+                    .get(term)
+                    .and_then(|queue| queue.last())
+                    .cloned()
+                    .unwrap_or_default()
+            };
+            let mut base = search(self.forge, term, 1, task.range);
+            if recent {
+                base = recent_search(self.forge, base, today.saturating_sub(7));
+            }
+            let url = match &task.next_url {
+                Some(raw) if self.forge == Forge::GitLab => gitlab_history_url(&base, raw)?,
+                Some(raw) => checked_page_url(&base, raw)?,
+                None => base.clone(),
             };
             let (mut value, headers) = self
                 .get(url.clone(), token.as_deref())?
@@ -379,7 +405,8 @@ impl Session<'_> {
             let items = if self.forge == Forge::GitHub {
                 let timed_out = value["incomplete_results"].as_bool() == Some(true);
                 incomplete |= timed_out;
-                if value["total_count"].as_u64().is_some_and(|n| n > 1000) || timed_out {
+                if !recent && (value["total_count"].as_u64().is_some_and(|n| n > 1000) || timed_out)
+                {
                     let [start, end] = task.range.unwrap_or([0, model::now() / DAY]);
                     if start < end {
                         let middle = start + (end - start) / 2;
@@ -440,34 +467,38 @@ impl Session<'_> {
             counts.invalid_entries += page_counts.invalid_entries;
             counts.accepted_candidates += page_counts.accepted_candidates;
 
-            let next = if split.is_some() {
+            let next = if recent || split.is_some() {
                 None
             } else {
                 next_page(self.forge, &base, &url, &headers)?
             };
             let progress = self.cache.progress.entry(self.forge).or_default();
-            progress.next_term = term_index;
-            if task.range.is_none() && task.next_url.is_none() {
-                progress.blocked_ranges.remove(term);
-            }
-            let queue = progress.terms.entry(term.into()).or_default();
-            queue.pop();
-            if let Some(ranges) = split {
-                queue.extend(ranges.into_iter().map(|range| SearchPage {
-                    range: Some(range),
-                    next_url: None,
-                }));
-            } else if let Some(next) = next {
-                queue.push(SearchPage {
-                    next_url: Some(next.into()),
-                    ..task
-                });
-            }
-            if capped {
-                progress.blocked_ranges.insert(term.into(), true);
-            }
-            if queue.is_empty() {
-                completed.insert(term);
+            if recent {
+                progress.next_recent = recent_index;
+            } else {
+                progress.next_term = term_index;
+                if task.range.is_none() && task.next_url.is_none() {
+                    progress.blocked_ranges.remove(term);
+                }
+                let queue = progress.terms.entry(term.into()).or_default();
+                queue.pop();
+                if let Some(ranges) = split {
+                    queue.extend(ranges.into_iter().map(|range| SearchPage {
+                        range: Some(range),
+                        next_url: None,
+                    }));
+                } else if let Some(next) = next {
+                    queue.push(SearchPage {
+                        next_url: Some(next.into()),
+                        ..task
+                    });
+                }
+                if capped {
+                    progress.blocked_ranges.insert(term.into(), true);
+                }
+                if queue.is_empty() {
+                    completed.insert(term);
+                }
             }
             let message = format!("Site-wide search · {counts} · synchronizing");
             let status = self.cache.status.entry(self.forge).or_default();
@@ -568,6 +599,61 @@ fn checked_page_url(base: &Url, raw: &str) -> Result<Url> {
     Ok(url)
 }
 
+fn set_query_pair(url: &mut Url, key: &str, value: &str) {
+    let query: Vec<_> = url
+        .query_pairs()
+        .filter(|(current, _)| current != key)
+        .map(|(k, v)| (k.into_owned(), v.into_owned()))
+        .collect();
+    url.query_pairs_mut()
+        .clear()
+        .extend_pairs(query)
+        .append_pair(key, value);
+}
+
+fn gitlab_history_url(base: &Url, raw: &str) -> Result<Url> {
+    if let Ok(url) = checked_page_url(base, raw) {
+        return Ok(url);
+    }
+    let mut legacy = base.clone();
+    set_query_pair(&mut legacy, "per_page", &GITLAB_PUBLIC_CHECKS.to_string());
+    let old = checked_page_url(&legacy, raw)?;
+    let offset = page_number(&old)?
+        .checked_sub(1)
+        .and_then(|page| page.checked_mul(GITLAB_PUBLIC_CHECKS))
+        .context("invalid GitLab offset")?;
+    let page = (offset / GITLAB_HISTORY_PAGE)
+        .checked_add(1)
+        .context("GitLab page overflow")?;
+    let mut url = base.clone();
+    set_query_pair(&mut url, "page", &page.to_string());
+    Ok(url)
+}
+
+fn recent_search(forge: Forge, mut url: Url, since: u64) -> Url {
+    match forge {
+        Forge::GitHub => {
+            if let Some((_, query)) = url
+                .query_pairs()
+                .find(|(key, _)| key == "q")
+                .map(|(k, v)| (k.into_owned(), v.into_owned()))
+            {
+                set_query_pair(
+                    &mut url,
+                    "q",
+                    &format!("{query} updated:>={}", utc_date(since)),
+                );
+            }
+        }
+        Forge::GitLab => set_query_pair(&mut url, "per_page", &GITLAB_RECENT_PAGE.to_string()),
+        Forge::Codeberg => {
+            url.query_pairs_mut()
+                .append_pair("since", &format!("{}T00:00:00Z", utc_date(since)));
+        }
+    }
+    url
+}
+
 fn page_number(url: &Url) -> Result<usize> {
     url.query_pairs()
         .find(|(key, _)| key == "page")
@@ -663,7 +749,7 @@ fn search(forge: Forge, term: &str, page: usize, range: Option<[u64; 2]>) -> Url
         &(if forge == Forge::GitHub {
             GITHUB_PAGE_SIZE
         } else if forge == Forge::GitLab {
-            GITLAB_PUBLIC_CHECKS
+            GITLAB_HISTORY_PAGE
         } else {
             PAGE
         })
@@ -839,6 +925,42 @@ mod tests {
                 && v.contains("is:public")
                 && v.contains("is:issue")));
         }
+    }
+
+    #[test]
+    fn targeted_queries_remain_public_and_preserve_recent_independence() {
+        let terms = discovery_terms(Forge::GitHub);
+        for (term, qualifier) in [
+            ("label:bounty", "label:bounty"),
+            (r#"label:"paid issue""#, "paid issue"),
+            (r#""algora.io""#, "algora.io"),
+            (r#""reverse engineering" bounty"#, "reverse engineering"),
+        ] {
+            assert!(terms.contains(&term));
+            let history = search(Forge::GitHub, term, 4, Some([0, 1]));
+            let recent = recent_search(Forge::GitHub, search(Forge::GitHub, term, 1, None), 1);
+            assert!(recent.query_pairs().any(|(k, v)| k == "q"
+                && v.contains("is:public")
+                && v.contains(qualifier)
+                && v.contains("updated:>=1970-01-02")));
+            assert_eq!(page_number(&history).unwrap(), 4);
+            assert_eq!(page_number(&recent).unwrap(), 1);
+        }
+        assert_eq!(recent_term(terms, 0, 8), ("bounty", 8));
+    }
+
+    #[test]
+    fn gitlab_legacy_cursor_keeps_exact_offset() {
+        let base = search(Forge::GitLab, "bounty", 1, None);
+        let mut old = search(Forge::GitLab, "bounty", 2, None);
+        set_query_pair(&mut old, "per_page", "18");
+        let resumed = gitlab_history_url(&base, old.as_str()).unwrap();
+        assert_eq!(page_number(&resumed).unwrap(), 3);
+        assert!(
+            resumed
+                .query_pairs()
+                .any(|(k, v)| k == "per_page" && v == "9")
+        );
     }
 
     #[test]

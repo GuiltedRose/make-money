@@ -297,6 +297,8 @@ pub struct SearchPage {
 pub struct SearchProgress {
     pub terms: BTreeMap<String, Vec<SearchPage>>,
     pub next_term: usize,
+    #[serde(default)]
+    pub next_recent: usize,
     pub blocked_ranges: BTreeMap<String, bool>,
 }
 
