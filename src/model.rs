@@ -279,12 +279,23 @@ impl std::fmt::Display for DiscoveryCounts {
 }
 
 #[derive(Clone, Default, Serialize, Deserialize)]
+pub struct RateBucket {
+    pub remaining: Option<u64>,
+    pub reset_at: Option<u64>,
+    pub retry_at: u64,
+    #[serde(default)]
+    pub consecutive_backoffs: u32,
+}
+
+#[derive(Clone, Default, Serialize, Deserialize)]
 pub struct Status {
     pub attempted: u64,
     pub message: String,
     pub retry_at: u64,
     #[serde(default)]
     pub counts: DiscoveryCounts,
+    #[serde(default)]
+    pub rate_buckets: BTreeMap<String, RateBucket>,
 }
 
 #[derive(Clone, Default, Serialize, Deserialize)]

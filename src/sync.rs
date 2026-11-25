@@ -212,10 +212,20 @@ struct Session<'a> {
 
 impl Session<'_> {
     fn get(&mut self, url: Url, token: Option<&str>) -> Result<Option<(Value, HeaderMap)>> {
+        let bucket = request_bucket(self.forge, &url, token.is_some());
+        let now = model::now();
+        let status = &self.cache.status[&self.forge];
         ensure!(
-            self.cache.status[&self.forge].retry_at <= model::now(),
+            status.retry_at <= now,
             "provider cooldown is active; pagination progress retained"
         );
+        if let Some(rate) = status.rate_buckets.get(bucket) {
+            ensure!(
+                rate.retry_at <= now,
+                "{bucket} API cooldown active for {} min; pagination progress retained",
+                (rate.retry_at.saturating_sub(now)).div_ceil(60)
+            );
+        }
         let mut request = self.client.get(url).header("Accept", "application/json");
         if let Some(token) = token {
             request = if self.forge == Forge::Codeberg {
@@ -228,57 +238,37 @@ impl Session<'_> {
                 request.bearer_auth(token)
             };
         }
-        let response = request.send().map_err(reqwest::Error::without_url)?;
+        let mut response = request.send().map_err(reqwest::Error::without_url)?;
         let headers = response.headers().clone();
         let status = response.status();
-        let exhausted = headers
-            .get("x-ratelimit-remaining")
-            .or_else(|| headers.get("ratelimit-remaining"))
-            .is_some_and(|h| h == "0");
-        if exhausted
-            || status == StatusCode::TOO_MANY_REQUESTS
-            || (self.forge == Forge::GitHub && status == StatusCode::FORBIDDEN)
-            || headers.contains_key("retry-after")
+        let secondary = if self.forge == Forge::GitHub
+            && status == StatusCode::FORBIDDEN
+            && !headers.contains_key("retry-after")
+            && remaining(&headers) != Some(0)
         {
-            let now = model::now();
-            let retry = headers
-                .get("retry-after")
-                .and_then(|h| h.to_str().ok())
-                .and_then(|h| {
-                    h.parse::<u64>()
-                        .ok()
-                        .map(|secs| now.saturating_add(secs))
-                        .or_else(|| {
-                            httpdate::parse_http_date(h)
-                                .ok()?
-                                .duration_since(UNIX_EPOCH)
-                                .ok()
-                                .map(|d| d.as_secs())
-                        })
-                });
-            let reset = headers
-                .get("x-ratelimit-reset")
-                .or_else(|| headers.get("ratelimit-reset"))
-                .and_then(|h| h.to_str().ok()?.parse::<u64>().ok());
-            let retry_at = retry
-                .into_iter()
-                .chain(reset)
-                .filter(|t| *t > now)
-                .max()
-                .unwrap_or_else(|| now.saturating_add(3600));
-            self.cache.status.entry(self.forge).or_default().retry_at = retry_at;
-            (self.commit)(self.cache, "Cooldown recorded".into())?;
-            let reason = if status == StatusCode::TOO_MANY_REQUESTS {
-                "rate limited"
-            } else if headers.contains_key("retry-after") {
-                "server requested backoff"
-            } else if exhausted {
-                "rate-limit quota exhausted"
-            } else {
-                "access forbidden"
-            };
+            let mut bytes = Vec::new();
+            response.by_ref().take(8192).read_to_end(&mut bytes).is_ok()
+                && github_secondary_limit(&bytes)
+        } else {
+            false
+        };
+        let state = self.cache.status.entry(self.forge).or_default();
+        if let Some((scope, retry_at)) = observe_rate(
+            self.forge,
+            bucket,
+            state,
+            status,
+            &headers,
+            secondary,
+            model::now(),
+        ) {
+            let message = format!(
+                "{scope} cooldown · retry in {} min",
+                retry_at.saturating_sub(model::now()).div_ceil(60)
+            );
+            (self.commit)(self.cache, message.clone())?;
             if !status.is_success() {
-                return Err(anyhow!("HTTP {} · {reason}", status.as_u16()));
+                return Err(anyhow!("HTTP {} · {message}", status.as_u16()));
             }
         }
         if matches!(status, StatusCode::NOT_FOUND | StatusCode::GONE) {
@@ -369,7 +359,7 @@ impl Session<'_> {
         let mut term_index = progress.next_term % terms.len();
         let mut recent_index = progress.next_recent;
         let today = model::now() / DAY;
-        let mut watchlist = Vec::new();
+        let mut watchlist: Vec<String> = Vec::new();
         let mut watch_reason = None;
         let mut watch_index = progress.next_watch;
 
@@ -574,7 +564,15 @@ impl Session<'_> {
             status.message = message.clone();
             status.counts = counts.clone();
             (self.commit)(self.cache, message)?;
-            if self.cache.status[&self.forge].retry_at > model::now() {
+            let status = &self.cache.status[&self.forge];
+            let bucket = request_bucket(self.forge, &url, !watching && token.is_some());
+            let now = model::now();
+            if status.retry_at > now
+                || status
+                    .rate_buckets
+                    .get(bucket)
+                    .is_some_and(|rate| rate.retry_at > now)
+            {
                 break;
             }
         }
@@ -603,6 +601,104 @@ impl Session<'_> {
             "Site-wide search".into()
         };
         Ok(format!("{mode} · {counts}{coverage}"))
+    }
+}
+
+fn request_bucket(forge: Forge, url: &Url, authenticated: bool) -> &'static str {
+    match forge {
+        Forge::GitHub if url.path() == "/search/issues" => "search",
+        Forge::GitHub => "core",
+        Forge::GitLab if authenticated => "authenticated",
+        Forge::GitLab => "anonymous",
+        Forge::Codeberg => "api",
+    }
+}
+
+fn header_number(headers: &HeaderMap, names: &[&str]) -> Option<u64> {
+    names
+        .iter()
+        .find_map(|name| headers.get(*name)?.to_str().ok()?.parse().ok())
+}
+
+fn remaining(headers: &HeaderMap) -> Option<u64> {
+    header_number(headers, &["x-ratelimit-remaining", "ratelimit-remaining"])
+}
+
+fn github_secondary_limit(bytes: &[u8]) -> bool {
+    let Ok(value) = serde_json::from_slice::<Value>(bytes) else {
+        return false;
+    };
+    value["message"].as_str().is_some_and(|message| {
+        let message = message.to_ascii_lowercase();
+        message.contains("secondary rate limit") || message.contains("abuse detection")
+    })
+}
+
+fn observe_rate(
+    forge: Forge,
+    bucket: &'static str,
+    state: &mut Status,
+    code: StatusCode,
+    headers: &HeaderMap,
+    secondary: bool,
+    now: u64,
+) -> Option<(&'static str, u64)> {
+    let remaining = remaining(headers);
+    let reset = header_number(headers, &["x-ratelimit-reset", "ratelimit-reset"]);
+    let retry_after = headers.get("retry-after");
+    let retry = retry_after
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| {
+            value
+                .parse::<u64>()
+                .ok()
+                .map(|seconds| now.saturating_add(seconds))
+                .or_else(|| {
+                    httpdate::parse_http_date(value)
+                        .ok()?
+                        .duration_since(UNIX_EPOCH)
+                        .ok()
+                        .map(|d| d.as_secs())
+                })
+        });
+    let rate = state.rate_buckets.entry(bucket.into()).or_default();
+    if remaining.is_some() {
+        rate.remaining = remaining;
+    }
+    if reset.is_some() {
+        rate.reset_at = reset;
+    }
+    let exhausted = remaining == Some(0);
+    if !exhausted && retry_after.is_none() && code != StatusCode::TOO_MANY_REQUESTS && !secondary {
+        if code.is_success() {
+            rate.consecutive_backoffs = 0;
+        }
+        return None;
+    }
+    let gitlab_named_bucket = forge == Forge::GitLab
+        && headers
+            .get("ratelimit-name")
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|name| match bucket {
+                "authenticated" => name == "throttle_authenticated_api",
+                "anonymous" => name == "throttle_unauthenticated_api",
+                _ => false,
+            });
+    let scoped = exhausted && !secondary && (forge == Forge::GitHub || gitlab_named_bucket);
+    let fallback = 3600_u64 << rate.consecutive_backoffs.min(4);
+    rate.consecutive_backoffs = rate.consecutive_backoffs.saturating_add(1);
+    let retry_at = retry
+        .into_iter()
+        .chain(reset.filter(|_| exhausted))
+        .filter(|time| *time > now)
+        .max()
+        .unwrap_or_else(|| now.saturating_add(fallback));
+    if scoped {
+        rate.retry_at = rate.retry_at.max(retry_at);
+        Some((bucket, rate.retry_at))
+    } else {
+        state.retry_at = state.retry_at.max(retry_at);
+        Some(("provider", state.retry_at))
     }
 }
 
@@ -1015,12 +1111,10 @@ fn run_forge(
             && (status.attempted == 0 || now.saturating_sub(status.attempted) >= 300),
         "refresh deferred by cooldown"
     );
-    *status = Status {
-        attempted: now,
-        message: "Refresh interrupted or in progress".into(),
-        retry_at: 0,
-        ..Status::default()
-    };
+    status.attempted = now;
+    status.message = "Refresh interrupted or in progress".into();
+    status.retry_at = 0;
+    status.counts = DiscoveryCounts::default();
     commit(&cache, "Refresh started".into())?;
     let mut session = Session {
         client,
@@ -1056,7 +1150,17 @@ fn run_forge(
         failed = true;
         message.push_str(&format!(" | Recheck failed: {error:#}"));
     }
-    cache.status.entry(forge).or_default().message = message.clone();
+    let status = cache.status.entry(forge).or_default();
+    let now = model::now();
+    for (bucket, rate) in &status.rate_buckets {
+        if rate.retry_at > now {
+            message.push_str(&format!(
+                " | {bucket} retry in {} min",
+                (rate.retry_at - now).div_ceil(60)
+            ));
+        }
+    }
+    status.message = message.clone();
     commit(&cache, message)?;
     ensure!(!failed, "provider refresh did not finish");
     Ok(())
@@ -1065,6 +1169,85 @@ fn run_forge(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rate_limits_isolate_github_search_and_honor_server_backoff() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-ratelimit-remaining", "0".parse().unwrap());
+        headers.insert("x-ratelimit-reset", "200".parse().unwrap());
+        let mut status = Status::default();
+        assert_eq!(
+            observe_rate(
+                Forge::GitHub,
+                "search",
+                &mut status,
+                StatusCode::OK,
+                &headers,
+                false,
+                100
+            ),
+            Some(("search", 200))
+        );
+        assert_eq!(status.retry_at, 0);
+        assert!(!status.rate_buckets.contains_key("core"));
+        headers.clear();
+        headers.insert("retry-after", "250".parse().unwrap());
+        assert_eq!(
+            observe_rate(
+                Forge::GitHub,
+                "core",
+                &mut status,
+                StatusCode::TOO_MANY_REQUESTS,
+                &headers,
+                false,
+                100
+            ),
+            Some(("provider", 350))
+        );
+    }
+
+    #[test]
+    fn gitlab_named_primary_and_codeberg_backoff_remain_distinct() {
+        let mut headers = HeaderMap::new();
+        headers.insert("ratelimit-remaining", "0".parse().unwrap());
+        headers.insert("ratelimit-reset", "200".parse().unwrap());
+        headers.insert(
+            "ratelimit-name",
+            "throttle_authenticated_api".parse().unwrap(),
+        );
+        let mut status = Status::default();
+        assert_eq!(
+            observe_rate(
+                Forge::GitLab,
+                "authenticated",
+                &mut status,
+                StatusCode::TOO_MANY_REQUESTS,
+                &headers,
+                false,
+                100
+            ),
+            Some(("authenticated", 200))
+        );
+        assert_eq!(status.retry_at, 0);
+        assert_eq!(
+            observe_rate(
+                Forge::Codeberg,
+                "api",
+                &mut status,
+                StatusCode::TOO_MANY_REQUESTS,
+                &headers,
+                false,
+                100
+            ),
+            Some(("provider", 200))
+        );
+        assert!(!github_secondary_limit(
+            br#"{"message":"Resource not accessible"}"#
+        ));
+        assert!(github_secondary_limit(
+            br#"{"message":"You exceeded a secondary rate limit."}"#
+        ));
+    }
 
     #[test]
     fn codeberg_watchlist_and_auth_resize_keep_public_scope_and_offset() {
