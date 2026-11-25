@@ -359,13 +359,13 @@ pub struct SearchProgress {
     #[serde(default)]
     pub next_recent: usize,
     #[serde(default)]
-    pub next_watch: usize,
-    #[serde(default)]
     pub catalog_next: Option<String>,
     #[serde(default)]
     pub catalog_day: Option<u64>,
     #[serde(default)]
     pub catalog_limited: bool,
+    #[serde(default)]
+    pub catalog_fallback_pending: bool,
     pub blocked_ranges: BTreeMap<String, bool>,
 }
 

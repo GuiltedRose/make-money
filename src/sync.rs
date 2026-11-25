@@ -350,6 +350,7 @@ impl Session<'_> {
         let mut failures = Vec::new();
         let mut catalog_pages = 0;
         let mut issue_pages = 0;
+        let mut unavailable_repositories = 0;
         let current_day = model::now() / DAY;
         let catalog_requests =
             if self.cache.progress[&self.forge].catalog_next.is_some() && budget >= 3 {
@@ -360,7 +361,7 @@ impl Session<'_> {
         for pass in 0..budget {
             let catalog = pass < catalog_requests;
             let step = if catalog {
-                self.catalog_page(current_day, pass == 1)
+                self.catalog_page(current_day, pass == 1).map(|()| true)
             } else {
                 let repos = self.cache.repositories.entry(self.forge).or_default();
                 let Some(repo) =
@@ -372,11 +373,13 @@ impl Session<'_> {
                 self.repository_issue_page(&repo, &mut seen, &mut counts)
             };
             match step {
-                Ok(()) => {
+                Ok(scanned) => {
                     if catalog {
                         catalog_pages += 1;
-                    } else {
+                    } else if scanned {
                         issue_pages += 1;
+                    } else {
+                        unavailable_repositories += 1;
                     }
                     let message =
                         format!("Anonymous repository discovery · {counts} · synchronizing");
@@ -420,7 +423,7 @@ impl Session<'_> {
             format!(" · {}", failures.join("; "))
         };
         Ok(format!(
-            "Anonymous repository discovery ({reason}) · partial coverage · {repository_count} indexed · {catalog_pages} catalog pages · {issue_pages} issue pages · {catalog_state} · {counts}{errors}"
+            "Anonymous repository discovery ({reason}) · partial coverage · {repository_count} indexed · {catalog_pages} catalog pages · {issue_pages} issue pages · {unavailable_repositories} unavailable repos · {catalog_state} · {counts}{errors}"
         ))
     }
 
@@ -487,7 +490,7 @@ impl Session<'_> {
         repo: &PublicRepository,
         seen: &mut HashSet<String>,
         counts: &mut DiscoveryCounts,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         let base = repository_issues(self.forge, &repo.path, repo.provider_id)?;
         let url = repo
             .issue_next
@@ -496,6 +499,7 @@ impl Session<'_> {
             .transpose()?
             .unwrap_or_else(|| base.clone());
         let response = self.get(url.clone(), None)?;
+        let scanned = response.is_some();
         let next = if let Some((value, headers)) = response {
             let entries = value.as_array().context("expected public issue list")?;
             let mut page_seen = HashSet::new();
@@ -519,7 +523,7 @@ impl Session<'_> {
             repo.scanned_at = model::now();
             repo.issue_next = next.map(Into::into);
         }
-        Ok(())
+        Ok(scanned)
     }
 
     fn discover(&mut self, root: &Path, codeberg_token: Option<&str>) -> Result<String> {
@@ -534,6 +538,26 @@ impl Session<'_> {
                 "GitLab global search requires authentication",
             );
         }
+        if self
+            .cache
+            .progress
+            .entry(self.forge)
+            .or_default()
+            .catalog_fallback_pending
+        {
+            let result = self.discover_public_repositories(
+                SEARCH_REQUESTS_PER_CYCLE,
+                "resuming fallback after the previous global failure",
+            );
+            if result.is_ok() {
+                self.cache
+                    .progress
+                    .entry(self.forge)
+                    .or_default()
+                    .catalog_fallback_pending = false;
+            }
+            return result;
+        }
         let mut counts = DiscoveryCounts::default();
         let mut incomplete = false;
         let mut public_checks = 0;
@@ -544,20 +568,9 @@ impl Session<'_> {
         let mut term_index = progress.next_term % terms.len();
         let mut recent_index = progress.next_recent;
         let today = model::now() / DAY;
-        let mut watchlist: Vec<String> = Vec::new();
-        let mut watch_reason = None;
-        let mut watch_index = progress.next_watch;
-
         for pass in 0..SEARCH_REQUESTS_PER_CYCLE {
-            let watching = !watchlist.is_empty();
-            let recent = !watching && pass < RECENT_REQUESTS_PER_CYCLE;
-            let mut watch_repo = None;
-            let term = if watching {
-                let index = watch_index % (watchlist.len() * TERMS.len());
-                watch_index = index + 1;
-                watch_repo = Some(watchlist[index / TERMS.len()].as_str());
-                TERMS[index % TERMS.len()]
-            } else if recent {
+            let recent = pass < RECENT_REQUESTS_PER_CYCLE;
+            let term = if recent {
                 let (term, next) = recent_term(terms, pass, recent_index);
                 recent_index = next;
                 term
@@ -572,8 +585,7 @@ impl Session<'_> {
                 term_index = (term_index + 1) % terms.len();
                 term
             };
-            let key =
-                watch_repo.map_or_else(|| term.to_owned(), |repo| format!("watch:{repo}:{term}"));
+            let key = term.to_owned();
             let progress = self.cache.progress.entry(self.forge).or_default();
             let task = if recent {
                 SearchPage::default()
@@ -585,59 +597,40 @@ impl Session<'_> {
                     .cloned()
                     .unwrap_or_default()
             };
-            let mut base = match watch_repo {
-                Some(repo) => codeberg_repo_search(repo, term),
-                None => search(self.forge, term, 1, task.range),
-            };
+            let mut base = search(self.forge, term, 1, task.range);
             if recent {
                 base = recent_search(self.forge, base, today.saturating_sub(7));
             }
-            let authenticated_codeberg =
-                self.forge == Forge::Codeberg && token.is_some() && !watching;
+            let authenticated_codeberg = self.forge == Forge::Codeberg && token.is_some();
             if authenticated_codeberg {
                 set_query_pair(&mut base, "limit", if recent { "1" } else { "2" });
             }
             let url = match &task.next_url {
                 Some(raw) if self.forge == Forge::GitLab => gitlab_history_url(&base, raw)?,
-                Some(raw) if self.forge == Forge::Codeberg && !watching => {
-                    codeberg_history_url(&base, raw)?
-                }
+                Some(raw) if self.forge == Forge::Codeberg => codeberg_history_url(&base, raw)?,
                 Some(raw) => checked_page_url(&base, raw)?,
                 None => base.clone(),
             };
-            let result = self.get(url.clone(), if watching { None } else { token.as_deref() });
+            let result = self.get(url.clone(), token.as_deref());
             let (mut value, headers) = match result {
                 Ok(Some(page)) => page,
-                result if self.forge != Forge::Codeberg && global_unavailable(&result) => {
-                    return self.discover_public_repositories(
-                        SEARCH_REQUESTS_PER_CYCLE - pass - 1,
-                        "global issue search unavailable",
-                    );
-                }
-                result
-                    if self.forge == Forge::Codeberg
-                        && !watching
-                        && global_unavailable(&result) =>
-                {
-                    watchlist = storage::codeberg_watchlist(root)?;
-                    let reason = match result {
-                        Err(error) => error.to_string(),
-                        _ => "global endpoint unavailable".into(),
-                    };
-                    ensure!(
-                        !watchlist.is_empty(),
-                        "Codeberg global search unavailable ({reason}); no codeberg-watchlist.txt entries"
-                    );
-                    watch_reason = Some(reason);
-                    continue;
-                }
-                Ok(None) if watching => {
-                    self.cache
-                        .progress
-                        .entry(self.forge)
-                        .or_default()
-                        .next_watch = watch_index;
-                    continue;
+                result if global_unavailable(&result) => {
+                    let reason = result
+                        .err()
+                        .map(|error| error.to_string())
+                        .unwrap_or_else(|| "global issue search unavailable".into());
+                    let budget = SEARCH_REQUESTS_PER_CYCLE - pass - 1;
+                    if budget == 0 {
+                        self.cache
+                            .progress
+                            .entry(self.forge)
+                            .or_default()
+                            .catalog_fallback_pending = true;
+                        return Ok(format!(
+                            "Global search unavailable ({reason}); anonymous repository fallback queued for next refresh · {counts}"
+                        ));
+                    }
+                    return self.discover_public_repositories(budget, &reason);
                 }
                 result => result?.context("issue search endpoint unavailable")?,
             };
@@ -722,11 +715,7 @@ impl Session<'_> {
             if recent {
                 progress.next_recent = recent_index;
             } else {
-                if watching {
-                    progress.next_watch = watch_index;
-                } else {
-                    progress.next_term = term_index;
-                }
+                progress.next_term = term_index;
                 if task.range.is_none() && task.next_url.is_none() {
                     progress.blocked_ranges.remove(&key);
                 }
@@ -746,7 +735,7 @@ impl Session<'_> {
                 if capped {
                     progress.blocked_ranges.insert(key, true);
                 }
-                if !watching && queue.is_empty() {
+                if queue.is_empty() {
                     completed.insert(term);
                 }
             }
@@ -756,7 +745,7 @@ impl Session<'_> {
             status.counts = counts.clone();
             (self.commit)(self.cache, message)?;
             let status = &self.cache.status[&self.forge];
-            let bucket = request_bucket(self.forge, &url, !watching && token.is_some());
+            let bucket = request_bucket(self.forge, &url, token.is_some());
             let now = model::now();
             if status.retry_at > now
                 || status
@@ -770,9 +759,7 @@ impl Session<'_> {
 
         let progress = self.cache.progress.entry(self.forge).or_default();
         let mut reasons = Vec::new();
-        if watch_reason.is_some() {
-            reasons.push("Codeberg global search unavailable; watchlist only");
-        } else if completed.len() != terms.len() {
+        if completed.len() != terms.len() {
             reasons.push("continuation saved for the next cycle");
         }
         if incomplete {
@@ -786,14 +773,10 @@ impl Session<'_> {
         } else {
             format!(" (partial coverage: {})", reasons.join(", "))
         };
-        let mode = if let Some(reason) = watch_reason {
-            format!("Watchlist fallback ({reason})")
+        let mode = if token.is_none() {
+            "Anonymous site-wide search"
         } else {
-            if token.is_none() {
-                "Anonymous site-wide search".into()
-            } else {
-                "Authenticated site-wide search".into()
-            }
+            "Authenticated site-wide search"
         };
         Ok(format!("{mode} · {counts}{coverage}"))
     }
@@ -850,7 +833,16 @@ fn repository_catalog(forge: Forge, day: u64) -> Result<Url> {
                 .append_pair("sort", "desc");
             Ok(url)
         }
-        Forge::Codeberg => Err(anyhow!("public repository catalog unavailable")),
+        Forge::Codeberg => {
+            let mut url = api(forge, &["repos", "search"]);
+            url.query_pairs_mut()
+                .append_pair("page", "1")
+                .append_pair("limit", &PAGE.to_string())
+                .append_pair("private", "false")
+                .append_pair("sort", "updated")
+                .append_pair("order", "desc");
+            Ok(url)
+        }
     }
 }
 
@@ -883,15 +875,27 @@ fn repository_issues(forge: Forge, path: &str, provider_id: Option<u64>) -> Resu
                 .append_pair("sort", "desc");
             Ok(url)
         }
-        Forge::Codeberg => Err(anyhow!("public repository issues unavailable")),
+        Forge::Codeberg => {
+            let (owner, repo) = path
+                .split_once('/')
+                .context("invalid Codeberg repository path")?;
+            ensure!(!repo.contains('/'), "invalid Codeberg repository path");
+            let mut url = api(forge, &["repos", owner, repo, "issues"]);
+            url.query_pairs_mut()
+                .append_pair("page", "1")
+                .append_pair("limit", &PAGE.to_string())
+                .append_pair("state", "open")
+                .append_pair("type", "issues");
+            Ok(url)
+        }
     }
 }
 
 fn catalog_entries(forge: Forge, value: &Value) -> Result<&Vec<Value>> {
-    let entries = if forge == Forge::GitHub {
-        &value["items"]
-    } else {
-        value
+    let entries = match forge {
+        Forge::GitHub => &value["items"],
+        Forge::GitLab => value,
+        Forge::Codeberg => &value["data"],
     };
     entries
         .as_array()
@@ -920,6 +924,12 @@ fn public_repository(forge: Forge, entry: &Value) -> Option<(String, String)> {
                 entry["path_with_namespace"].as_str()?,
                 entry["last_activity_at"].as_str(),
             )
+        }
+        Forge::Codeberg
+            if entry["private"].as_bool() == Some(false)
+                && entry["has_issues"].as_bool() != Some(false) =>
+        {
+            (entry["full_name"].as_str()?, entry["updated_at"].as_str())
         }
         _ => return None,
     };
@@ -1077,7 +1087,7 @@ fn utc_date(day: u64) -> String {
 }
 
 fn checked_page_url(base: &Url, raw: &str) -> Result<Url> {
-    let url = base.join(raw)?;
+    let mut url = base.join(raw)?;
     ensure!(
         url.origin() == base.origin()
             && url.path() == base.path()
@@ -1087,11 +1097,19 @@ fn checked_page_url(base: &Url, raw: &str) -> Result<Url> {
         "unexpected pagination link"
     );
     for (key, value) in base.query_pairs().filter(|(key, _)| key != "page") {
+        let mut matches = url.query_pairs().filter(|(actual, _)| actual == &key);
+        let supplied = matches.next().map(|(_, value)| value.into_owned());
         ensure!(
-            url.query_pairs()
-                .any(|(actual_key, actual_value)| actual_key == key && actual_value == value),
+            matches.next().is_none()
+                && supplied
+                    .as_deref()
+                    .is_none_or(|actual| actual == value.as_ref()),
             "pagination link changed the search"
         );
+        drop(matches);
+        if supplied.is_none() {
+            url.query_pairs_mut().append_pair(&key, &value);
+        }
     }
     Ok(url)
 }
@@ -1125,20 +1143,6 @@ fn gitlab_history_url(base: &Url, raw: &str) -> Result<Url> {
     let mut url = base.clone();
     set_query_pair(&mut url, "page", &page.to_string());
     Ok(url)
-}
-
-fn codeberg_repo_search(repo: &str, term: &str) -> Url {
-    let (owner, repo) = repo
-        .split_once('/')
-        .expect("validated Codeberg watchlist path");
-    let mut url = api(Forge::Codeberg, &["repos", owner, repo, "issues"]);
-    url.query_pairs_mut()
-        .append_pair("page", "1")
-        .append_pair("limit", &PAGE.to_string())
-        .append_pair("q", term)
-        .append_pair("state", "open")
-        .append_pair("type", "issues");
-    url
 }
 
 fn codeberg_history_url(base: &Url, raw: &str) -> Result<Url> {
@@ -1505,6 +1509,18 @@ mod tests {
     use super::*;
 
     #[test]
+    fn pagination_restores_omitted_public_filters_but_rejects_conflicts() {
+        let base = repository_catalog(Forge::Codeberg, 0).unwrap();
+        let next = checked_page_url(&base, "?page=2&limit=20").unwrap();
+        assert!(
+            next.query_pairs()
+                .any(|(k, v)| k == "private" && v == "false")
+        );
+        assert!(checked_page_url(&base, "?page=2&private=true").is_err());
+        assert!(checked_page_url(&base, "?page=2&private=false&private=true").is_err());
+    }
+
+    #[test]
     fn github_anonymous_repository_fallback_uses_separate_quota_and_pagination() {
         let catalog = repository_catalog(Forge::GitHub, 40).unwrap();
         assert_eq!(catalog.path(), "/search/repositories");
@@ -1679,8 +1695,32 @@ mod tests {
     }
 
     #[test]
-    fn codeberg_watchlist_and_auth_resize_keep_public_scope_and_offset() {
-        let scoped = codeberg_repo_search("owner/project", "bounty");
+    fn codeberg_anonymous_catalog_public_issues_and_optional_auth_offset() {
+        let catalog = repository_catalog(Forge::Codeberg, 0).unwrap();
+        assert_eq!(catalog.path(), "/api/v1/repos/search");
+        assert!(
+            catalog
+                .query_pairs()
+                .any(|(k, v)| k == "private" && v == "false")
+        );
+        let data = serde_json::json!({"data":[{"full_name":"owner/project","private":false,"updated_at":"2026-01-01"}]});
+        assert_eq!(
+            public_repository(
+                Forge::Codeberg,
+                &catalog_entries(Forge::Codeberg, &data).unwrap()[0]
+            )
+            .unwrap()
+            .0,
+            "owner/project"
+        );
+        assert!(
+            public_repository(
+                Forge::Codeberg,
+                &serde_json::json!({"full_name":"owner/project","private":true})
+            )
+            .is_none()
+        );
+        let scoped = repository_issues(Forge::Codeberg, "owner/project", None).unwrap();
         assert_eq!(scoped.path(), "/api/v1/repos/owner/project/issues");
         assert!(
             scoped

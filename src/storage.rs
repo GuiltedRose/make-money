@@ -287,53 +287,58 @@ pub fn credential(name: &str) -> Result<Option<String>> {
         .map(str::to_owned))
 }
 
-pub fn codeberg_watchlist(root: &Path) -> Result<Vec<String>> {
-    use std::io::Read;
-    let file = match File::open(root.join("codeberg-watchlist.txt")) {
-        Ok(file) => file,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(e) => return Err(e.into()),
-    };
-    let mut contents = String::new();
-    file.take(16_385).read_to_string(&mut contents)?;
-    ensure!(
-        contents.len() <= 16_384,
-        "Codeberg watchlist exceeds 16 KiB"
-    );
-    parse_watchlist(&contents)
-}
-
-fn parse_watchlist(contents: &str) -> Result<Vec<String>> {
-    let mut repos = Vec::new();
-    for (index, line) in contents.lines().enumerate() {
-        let repo = line.trim();
-        if repo.is_empty() || repo.starts_with('#') {
-            continue;
-        }
-        ensure!(
-            valid_path(repo) && repo.split('/').count() == 2,
-            "invalid Codeberg watchlist entry on line {}",
-            index + 1
-        );
-        let repo = repo.to_ascii_lowercase();
-        if !repos.contains(&repo) {
-            repos.push(repo);
-        }
-    }
-    Ok(repos)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn watchlist_validates_and_deduplicates_public_repository_paths() {
-        assert_eq!(
-            parse_watchlist("# repos\n Owner/Project \nowner/project").unwrap(),
-            ["owner/project"]
-        );
-        assert!(parse_watchlist("https://codeberg.org/owner/project").is_err());
-        assert!(parse_watchlist("owner/../project").is_err());
+    fn repository_and_issue_cursors_survive_reopening_independently() -> Result<()> {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "forge-bounties-cursors-{}-{unique}",
+            std::process::id()
+        ));
+        fs::create_dir(&root)?;
+        let result = (|| -> Result<()> {
+            prepare(&root)?;
+            let forge = Forge::Codeberg;
+            let mut cache = Cache::default();
+            cache.progress.entry(forge).or_default().catalog_next =
+                Some("https://codeberg.org/api/v1/repos/search?page=2".into());
+            let repo = PublicRepository {
+                path: "owner/project".into(),
+                issue_next: Some(
+                    "https://codeberg.org/api/v1/repos/owner/project/issues?page=7".into(),
+                ),
+                ..PublicRepository::default()
+            };
+            cache
+                .repositories
+                .entry(forge)
+                .or_default()
+                .insert(repo.path.clone(), repo);
+            commit_forge(&root, &Cache::default(), &cache, forge)?;
+            let mut loaded = load(&root)?;
+            load_repository_index(&root, &mut loaded)?;
+            assert!(
+                loaded.progress[&forge]
+                    .catalog_next
+                    .as_deref()
+                    .unwrap()
+                    .ends_with("page=2")
+            );
+            assert!(
+                loaded.repositories[&forge]["owner/project"]
+                    .issue_next
+                    .as_deref()
+                    .unwrap()
+                    .ends_with("page=7")
+            );
+            Ok(())
+        })();
+        fs::remove_dir_all(root)?;
+        result
     }
 }

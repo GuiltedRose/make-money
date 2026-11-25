@@ -26,7 +26,7 @@ BOUNTY_HOME="$scratch" target/release/forge-bounties --status
 BOUNTY_HOME="$scratch" target/release/forge-bounties
 ```
 
-Check each forge's status for successful site-wide searches. If Codeberg falls back to watched repositories, its status reports limited coverage. Wait for any reported cooldown before retrying. Verify that a returned bounty has reward evidence and a working source link, then reopen the GUI with networking disabled and check that the cached bounty still loads.
+Check each forge's status for successful site-wide searches. The provider status distinguishes anonymous global search, optional authenticated global search, and partial public repository coverage. Wait for any reported cooldown before retrying. Verify that a returned bounty has reward evidence and a working source link, then reopen the GUI with networking disabled and check that the cached bounty still loads.
 
 ## Activate
 
@@ -47,7 +47,7 @@ sed "s|^Exec=.*|Exec=\"$HOME/.local/bin/forge-bounties\"|" ops/forge-bounties.de
 "$HOME/.local/bin/forge-bounties"
 ```
 
-GitLab.com works without credentials by indexing recently active public projects and paging through their public issues. Optionally set `GITLAB_TOKEN` with `read_api` for GitLab’s authenticated global index. The app verifies those issue results anonymously before caching them. GitHub optionally accepts `GITHUB_TOKEN` for public search. Codeberg uses anonymous global search by default. You may set `CODEBERG_TOKEN` in the same file or environment with a public-only token limited to reading issues. Authenticated candidates are checked anonymously before caching. Those checks share Codeberg’s existing request budget. The GUI and timer can both read the optional GitLab token from `~/.config/forge-bounties/credentials.env` with mode 600, one `GITLAB_TOKEN=value` per line. For GitHub, set `GITHUB_TOKEN` in the launching shell or in the timer’s environment file. To create or edit the file locally:
+GitLab.com works without credentials by indexing recently active public projects and paging through their public issues. Optionally set `GITLAB_TOKEN` with `read_api` for GitLab’s authenticated global index. The app verifies those issue results anonymously before caching them. GitHub optionally accepts `GITHUB_TOKEN` for public search. Codeberg tries anonymous global search by default. You may set `CODEBERG_TOKEN` in the same file or environment with a public-only token limited to reading issues. Authenticated candidates are checked anonymously before caching. Those checks share Codeberg’s existing request budget. The GUI and timer can both read the optional GitLab token from `~/.config/forge-bounties/credentials.env` with mode 600, one `GITLAB_TOKEN=value` per line. For GitHub, set `GITHUB_TOKEN` in the launching shell or in the timer’s environment file. To create or edit the file locally:
 
 ```sh
 touch "$HOME/.config/forge-bounties/credentials.env"
@@ -55,7 +55,9 @@ chmod 600 "$HOME/.config/forge-bounties/credentials.env"
 ${EDITOR:-vi} "$HOME/.config/forge-bounties/credentials.env"
 ```
 
-For Codeberg fallback, create `codeberg-watchlist.txt` in the data directory and list one public `owner/repository` per line. The fallback searches those repositories when the global endpoint is unavailable, preserves independent per-repository continuations, and never bypasses a cooldown. The worker probes site-wide search again on the next eligible cycle.
+When a global issue endpoint is unavailable, the provider scans public repositories from its official catalog. Repositories are discovered automatically and prioritized by activity among similarly scanned repositories. SQLite stores the catalog continuation and each repository’s issue continuation separately from global issue search. Catalog results and issue scans are bounded samples. The status reports repository coverage separately and honors any active cooldown. No repository list or credentials are needed for basic discovery.
+
+Existing fiat amounts and explicit USDC, USDT, SOL, ETH and BTC amounts are supported. Crypto amounts retain their written decimal precision. The app does not infer a blockchain network or perform transactions.
 
 Optional background refresh runs every hour with up to two minutes of jitter. To update an existing timer, reinstall the units below, reload systemd, and run `systemctl --user restart forge-bounties.timer`.
 
