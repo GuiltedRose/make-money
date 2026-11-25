@@ -248,8 +248,34 @@ pub fn reward_evidence(title: &str, body: &str, labels: &[String]) -> RewardEvid
     result.map_or(RewardEvidence::Missing, RewardEvidence::Stated)
 }
 
+#[cfg(test)]
 pub fn reward(title: &str, body: &str, labels: &[String]) -> Option<Reward> {
     reward_evidence(title, body, labels).into_reward()
+}
+
+#[derive(Clone, Default, Serialize, Deserialize)]
+pub struct DiscoveryCounts {
+    pub scanned: usize,
+    pub duplicates: usize,
+    pub missing_rewards: usize,
+    pub ambiguous_rewards: usize,
+    pub invalid_entries: usize,
+    pub accepted_candidates: usize,
+}
+
+impl std::fmt::Display for DiscoveryCounts {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} scanned, {} accepted, {} duplicate, {} missing reward, {} ambiguous, {} invalid",
+            self.scanned,
+            self.accepted_candidates,
+            self.duplicates,
+            self.missing_rewards,
+            self.ambiguous_rewards,
+            self.invalid_entries
+        )
+    }
 }
 
 #[derive(Clone, Default, Serialize, Deserialize)]
@@ -257,6 +283,8 @@ pub struct Status {
     pub attempted: u64,
     pub message: String,
     pub retry_at: u64,
+    #[serde(default)]
+    pub counts: DiscoveryCounts,
 }
 
 #[derive(Clone, Default, Serialize, Deserialize)]

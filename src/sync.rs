@@ -1,5 +1,8 @@
 use crate::{
-    model::{self, Availability, Cache, Forge, Issue, SearchPage, Status},
+    model::{
+        self, Availability, Cache, DiscoveryCounts, Forge, Issue, RewardEvidence, SearchPage,
+        Status,
+    },
     storage,
 };
 use anyhow::{Context, Result, anyhow, ensure};
@@ -57,7 +60,7 @@ enum Label {
 }
 
 impl Remote {
-    fn into_issue(self, forge: Forge) -> Result<Option<Issue>> {
+    fn into_issue(self, forge: Forge) -> Result<Option<(Issue, bool)>> {
         if self.pull_request.is_some()
             || self.confidential == Some(true)
             || self.archived == Some(true)
@@ -78,7 +81,9 @@ impl Remote {
                 Label::Text(name) | Label::Object { name } => name,
             })
             .collect();
-        let reward = model::reward(&self.title, &body, &labels);
+        let evidence = model::reward_evidence(&self.title, &body, &labels);
+        let ambiguous = evidence == RewardEvidence::Ambiguous;
+        let reward = evidence.into_reward();
         let state = match self.state.as_str() {
             "closed" => Availability::Closed,
             "open" | "opened" => match (self.assignees, self.assignee) {
@@ -90,17 +95,20 @@ impl Remote {
             },
             _ => Availability::Unreachable,
         };
-        Ok(Some(Issue {
-            forge,
-            provider_id: self.id,
-            title: self.title,
-            url: url.into(),
-            labels,
-            state,
-            reward,
-            checked: model::now(),
-            body: body.chars().take(12_000).collect(),
-        }))
+        Ok(Some((
+            Issue {
+                forge,
+                provider_id: self.id,
+                title: self.title,
+                url: url.into(),
+                labels,
+                state,
+                reward,
+                checked: model::now(),
+                body: body.chars().take(12_000).collect(),
+            },
+            ambiguous,
+        )))
     }
 }
 
@@ -248,6 +256,11 @@ impl Session<'_> {
 
     fn update(&mut self, remote: Value, previous: Option<&str>) -> Result<()> {
         let issue = serde_json::from_value::<Remote>(remote)?.into_issue(self.forge)?;
+        self.store_issue(issue.map(|(issue, _)| issue), previous);
+        Ok(())
+    }
+
+    fn store_issue(&mut self, issue: Option<Issue>, previous: Option<&str>) {
         if let Some(issue) = issue {
             let key = issue.key();
             if issue.reward.is_some()
@@ -267,7 +280,6 @@ impl Session<'_> {
             existing.state = Availability::Unreachable;
             existing.checked = model::now();
         }
-        Ok(())
     }
 
     fn recheck(&mut self) -> Result<()> {
@@ -303,7 +315,7 @@ impl Session<'_> {
             Forge::GitLab => Some(storage::gitlab_token()?),
             Forge::Codeberg => None,
         };
-        let mut scanned = 0;
+        let mut counts = DiscoveryCounts::default();
         let mut incomplete = false;
         let mut public_checks = 0;
         let mut seen = HashSet::new();
@@ -358,37 +370,52 @@ impl Session<'_> {
                 value
             };
             let items = items.as_array().context("expected issue list")?;
-            scanned += items.len();
+            let mut page_seen = HashSet::new();
+            let mut page_counts = DiscoveryCounts::default();
+            let candidates =
+                decode_page(self.forge, items, &seen, &mut page_seen, &mut page_counts);
             if self.forge == Forge::GitLab {
-                // Work out the full page's verification cost before accepting any progress.
-                let mut candidates = Vec::new();
-                let mut ids = HashSet::new();
-                for entry in items {
-                    let candidate =
-                        serde_json::from_value::<Remote>(entry.clone())?.into_issue(self.forge)?;
-                    if let Some(issue) = candidate.filter(|issue| issue.reward.is_some()) {
-                        let key = issue.key();
-                        if !seen.contains(&key) && ids.insert(key) {
-                            candidates.push(issue);
-                        }
-                    }
-                }
-                if public_checks + candidates.len() > GITLAB_PUBLIC_CHECKS {
+                let payable = candidates
+                    .iter()
+                    .filter(|issue| issue.reward.is_some())
+                    .count();
+                if public_checks + payable > GITLAB_PUBLIC_CHECKS {
                     break;
                 }
-                for issue in candidates {
+                for issue in candidates
+                    .into_iter()
+                    .filter(|issue| issue.reward.is_some())
+                {
                     let (_, endpoint) = issue_url(self.forge, &issue.url)?;
                     public_checks += 1;
                     if let Some((public, _)) = self.get(endpoint, None)? {
-                        self.update(public, None)?;
+                        match serde_json::from_value::<Remote>(public)
+                            .map_err(anyhow::Error::from)
+                            .and_then(|remote| remote.into_issue(self.forge))
+                        {
+                            Ok(Some((public, _))) if public.key() == issue.key() => {
+                                page_counts.accepted_candidates +=
+                                    usize::from(public.reward.is_some());
+                                self.store_issue(Some(public), None);
+                            }
+                            Ok(None) => {}
+                            _ => page_counts.invalid_entries += 1,
+                        }
                     }
-                    seen.insert(issue.key());
                 }
             } else {
-                for entry in items {
-                    self.update(entry.clone(), None)?;
+                for issue in candidates {
+                    page_counts.accepted_candidates += usize::from(issue.reward.is_some());
+                    self.store_issue(Some(issue), None);
                 }
             }
+            seen.extend(page_seen);
+            counts.scanned += page_counts.scanned;
+            counts.duplicates += page_counts.duplicates;
+            counts.missing_rewards += page_counts.missing_rewards;
+            counts.ambiguous_rewards += page_counts.ambiguous_rewards;
+            counts.invalid_entries += page_counts.invalid_entries;
+            counts.accepted_candidates += page_counts.accepted_candidates;
 
             let next = if split.is_some() {
                 None
@@ -419,8 +446,10 @@ impl Session<'_> {
             if queue.is_empty() {
                 completed.insert(term);
             }
-            let message = format!("Site-wide search scanned {scanned} results · synchronizing");
-            self.cache.status.entry(self.forge).or_default().message = message.clone();
+            let message = format!("Site-wide search · {counts} · synchronizing");
+            let status = self.cache.status.entry(self.forge).or_default();
+            status.message = message.clone();
+            status.counts = counts.clone();
             (self.commit)(self.cache, message)?;
             if self.cache.status[&self.forge].retry_at > model::now() {
                 break;
@@ -443,10 +472,42 @@ impl Session<'_> {
         } else {
             format!(" (partial coverage: {})", reasons.join(", "))
         };
-        Ok(format!(
-            "Site-wide search scanned {scanned} results{coverage}"
-        ))
+        Ok(format!("Site-wide search · {counts}{coverage}"))
     }
+}
+
+fn decode_page(
+    forge: Forge,
+    entries: &[Value],
+    seen: &HashSet<String>,
+    page_seen: &mut HashSet<String>,
+    counts: &mut DiscoveryCounts,
+) -> Vec<Issue> {
+    let mut issues = Vec::new();
+    for entry in entries {
+        counts.scanned += 1;
+        match serde_json::from_value::<Remote>(entry.clone())
+            .map_err(anyhow::Error::from)
+            .and_then(|remote| remote.into_issue(forge))
+        {
+            Ok(Some((issue, ambiguous))) => {
+                let key = issue.key();
+                if seen.contains(&key) || !page_seen.insert(key) {
+                    counts.duplicates += 1;
+                    continue;
+                }
+                if ambiguous {
+                    counts.ambiguous_rewards += 1;
+                } else if issue.reward.is_none() {
+                    counts.missing_rewards += 1;
+                }
+                issues.push(issue);
+            }
+            Ok(None) => {}
+            Err(_) => counts.invalid_entries += 1,
+        }
+    }
+    issues
 }
 
 const DAY: u64 = 86_400;
@@ -702,6 +763,7 @@ fn run_forge(
         attempted: now,
         message: "Refresh interrupted or in progress".into(),
         retry_at: 0,
+        ..Status::default()
     };
     commit(&cache, "Refresh started".into())?;
     let mut session = Session {
@@ -737,6 +799,28 @@ fn run_forge(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn malformed_entries_do_not_discard_valid_neighbors() {
+        let issue = serde_json::json!({
+            "id": 12, "title": "[Bounty] $75", "state": "open",
+            "html_url": "https://github.com/owner/project/issues/8"
+        });
+        let mut counts = DiscoveryCounts::default();
+        let rows = decode_page(
+            Forge::GitHub,
+            &[serde_json::json!({}), issue.clone(), issue],
+            &HashSet::new(),
+            &mut HashSet::new(),
+            &mut counts,
+        );
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].reward.is_some());
+        assert_eq!(
+            (counts.scanned, counts.invalid_entries, counts.duplicates),
+            (3, 1, 1)
+        );
+    }
 
     #[test]
     fn builds_gitlab_nested_project_requests() {
