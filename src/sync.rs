@@ -352,12 +352,12 @@ impl Session<'_> {
         let mut issue_pages = 0;
         let mut unavailable_repositories = 0;
         let current_day = model::now() / DAY;
-        let catalog_requests =
-            if self.cache.progress[&self.forge].catalog_next.is_some() && budget >= 3 {
-                2
-            } else {
-                1
-            };
+        let progress = self.cache.progress.entry(self.forge).or_default();
+        let catalog_requests = if progress.catalog_next.is_some() && budget >= 3 {
+            2
+        } else {
+            1
+        };
         for pass in 0..budget {
             let catalog = pass < catalog_requests;
             let step = if catalog {
@@ -526,7 +526,7 @@ impl Session<'_> {
         Ok(scanned)
     }
 
-    fn discover(&mut self, root: &Path, codeberg_token: Option<&str>) -> Result<String> {
+    fn discover(&mut self, codeberg_token: Option<&str>) -> Result<String> {
         let token = match self.forge {
             Forge::GitHub => std::env::var("GITHUB_TOKEN").ok(),
             Forge::GitLab => storage::credential("GITLAB_TOKEN")?,
@@ -1474,7 +1474,7 @@ fn run_forge(
     let discovery = if session.cache.status[&forge].retry_at > model::now() {
         Err(anyhow!("discovery deferred by cooldown"))
     } else {
-        codeberg_token.and_then(|token| session.discover(root, token.as_deref()))
+        codeberg_token.and_then(|token| session.discover(token.as_deref()))
     };
     let mut failed = false;
     let mut message = match discovery {
@@ -1507,6 +1507,27 @@ fn run_forge(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn anonymous_gitlab_initializes_missing_progress_before_catalog_access() {
+        let mut cache = Cache::default();
+        let mut session = Session {
+            client: Client::new(),
+            cache: &mut cache,
+            forge: Forge::GitLab,
+            commit: &|_, _| Ok(()),
+        };
+        // A zero-request budget exercises initialization without external I/O.
+        let message = session
+            .discover_public_repositories(0, "GitLab global search requires authentication")
+            .unwrap();
+        assert!(message.contains("catalog not advanced"));
+        assert!(
+            session.cache.progress[&Forge::GitLab]
+                .catalog_next
+                .is_none()
+        );
+    }
 
     #[test]
     fn pagination_restores_omitted_public_filters_but_rejects_conflicts() {
