@@ -19,9 +19,6 @@ cargo generate-lockfile  # First build only, if Cargo.lock is absent
 cargo test --locked
 cargo build --release --locked
 
-read -rsp 'GitLab read_api token: ' GITLAB_TOKEN
-printf '\n'
-export GITLAB_TOKEN
 scratch=$(mktemp -d)
 BOUNTY_HOME="$scratch" target/release/forge-bounties --status
 BOUNTY_HOME="$scratch" target/release/forge-bounties --sync
@@ -50,7 +47,7 @@ sed "s|^Exec=.*|Exec=\"$HOME/.local/bin/forge-bounties\"|" ops/forge-bounties.de
 "$HOME/.local/bin/forge-bounties"
 ```
 
-Create a GitLab.com personal access token with the `read_api` scope and supply it as `GITLAB_TOKEN`. The app uses it for instance-wide search and fetches the public issue separately without credentials. GitHub optionally accepts `GITHUB_TOKEN` for public search. Codeberg uses anonymous global search by default. You may set `CODEBERG_TOKEN` in the same file or environment with a public-only token limited to reading issues. Authenticated candidates are checked anonymously before caching. Those checks share Codeberg’s existing request budget. The GUI and timer both read the GitLab token from `~/.config/forge-bounties/credentials.env` with mode 600, one `GITLAB_TOKEN=value` per line. For GitHub, set `GITHUB_TOKEN` in the launching shell or in the timer’s environment file. To create or edit the file locally:
+GitLab.com works without credentials by indexing recently active public projects and paging through their public issues. Optionally set `GITLAB_TOKEN` with `read_api` for GitLab’s authenticated global index. The app verifies those issue results anonymously before caching them. GitHub optionally accepts `GITHUB_TOKEN` for public search. Codeberg uses anonymous global search by default. You may set `CODEBERG_TOKEN` in the same file or environment with a public-only token limited to reading issues. Authenticated candidates are checked anonymously before caching. Those checks share Codeberg’s existing request budget. The GUI and timer can both read the optional GitLab token from `~/.config/forge-bounties/credentials.env` with mode 600, one `GITLAB_TOKEN=value` per line. For GitHub, set `GITHUB_TOKEN` in the launching shell or in the timer’s environment file. To create or edit the file locally:
 
 ```sh
 touch "$HOME/.config/forge-bounties/credentials.env"

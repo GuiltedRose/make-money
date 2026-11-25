@@ -360,7 +360,20 @@ pub struct SearchProgress {
     pub next_recent: usize,
     #[serde(default)]
     pub next_watch: usize,
+    #[serde(default)]
+    pub catalog_next: Option<String>,
+    #[serde(default)]
+    pub catalog_day: Option<u64>,
     pub blocked_ranges: BTreeMap<String, bool>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct PublicRepository {
+    pub path: String,
+    pub activity: String,
+    pub added_at: u64,
+    pub scanned_at: u64,
+    pub issue_next: Option<String>,
 }
 
 #[derive(Default, Serialize, Deserialize)]
@@ -369,6 +382,8 @@ pub struct Cache {
     pub status: BTreeMap<Forge, Status>,
     #[serde(default)]
     pub progress: BTreeMap<Forge, SearchProgress>,
+    #[serde(skip)]
+    pub repositories: BTreeMap<Forge, BTreeMap<String, PublicRepository>>,
 }
 
 pub fn now() -> u64 {

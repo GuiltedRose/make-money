@@ -1,4 +1,4 @@
-use crate::model::{Cache, Forge, Issue, SearchProgress, Status};
+use crate::model::{Cache, Forge, Issue, PublicRepository, SearchProgress, Status};
 use anyhow::{Context, Result, ensure};
 use rusqlite::{Connection, OpenFlags, Transaction, params};
 use std::{
@@ -87,6 +87,29 @@ pub fn load(root: &Path) -> Result<Cache> {
     Ok(cache)
 }
 
+pub fn load_repository_index(root: &Path, cache: &mut Cache) -> Result<()> {
+    let db = Connection::open_with_flags(root.join(DATABASE), OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    db.busy_timeout(Duration::from_secs(2))?;
+    let mut query = db.prepare("SELECT forge, data FROM public_repositories")?;
+    let mut rows = query.query([])?;
+    while let Some(row) = rows.next()? {
+        let forge: String = row.get(0)?;
+        let data: String = row.get(1)?;
+        let repo: PublicRepository = serde_json::from_str(&data)?;
+        cache
+            .repositories
+            .entry(serde_json::from_str(&forge)?)
+            .or_default()
+            .insert(repo.path.clone(), repo);
+    }
+    Ok(())
+}
+
+const CREATE_REPOSITORIES: &str = "CREATE TABLE IF NOT EXISTS public_repositories (
+         forge TEXT NOT NULL, path TEXT NOT NULL, data TEXT NOT NULL,
+         PRIMARY KEY (forge, path)
+     )";
+
 fn put_issue(tx: &Transaction<'_>, key: &str, issue: &Issue) -> Result<()> {
     tx.execute(
         "INSERT INTO issues (issue_key, data) VALUES (?1, ?2)
@@ -118,6 +141,9 @@ fn put_state(
 pub fn prepare(root: &Path) -> Result<()> {
     let path = root.join(DATABASE);
     if path.try_exists()? {
+        let db = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_WRITE)?;
+        db.busy_timeout(Duration::from_secs(2))?;
+        db.execute_batch(CREATE_REPOSITORIES)?;
         return Ok(());
     }
     let cache = legacy(root)?;
@@ -133,6 +159,7 @@ pub fn prepare(root: &Path) -> Result<()> {
         "CREATE TABLE issues (issue_key TEXT PRIMARY KEY NOT NULL, data TEXT NOT NULL);
          CREATE TABLE forge_state (forge TEXT PRIMARY KEY NOT NULL, status TEXT, progress TEXT);",
     )?;
+    tx.execute_batch(CREATE_REPOSITORIES)?;
     for (key, issue) in &cache.issues {
         put_issue(&tx, key, issue)?;
     }
@@ -173,6 +200,19 @@ pub fn commit_forge(root: &Path, previous: &Cache, local: &Cache, forge: Forge) 
         local.status.get(&forge),
         local.progress.get(&forge),
     )?;
+    if let Some(repositories) = local.repositories.get(&forge) {
+        let forge_key = serde_json::to_string(&forge)?;
+        let previous = previous.repositories.get(&forge);
+        for (path, repo) in repositories {
+            if previous.and_then(|repos| repos.get(path)) != Some(repo) {
+                tx.execute(
+                    "INSERT INTO public_repositories (forge, path, data) VALUES (?1, ?2, ?3)
+                     ON CONFLICT(forge, path) DO UPDATE SET data = excluded.data",
+                    params![forge_key, path, serde_json::to_string(repo)?],
+                )?;
+            }
+        }
+    }
     tx.commit()?;
     Ok(())
 }
@@ -187,11 +227,6 @@ pub fn lock(root: &Path) -> Result<File> {
         .open(root.join("refresh.lock"))?;
     file.try_lock().context("another refresh may be running")?;
     Ok(file)
-}
-
-pub fn gitlab_token() -> Result<String> {
-    credential("GITLAB_TOKEN")?
-        .context("Set GITLAB_TOKEN (read_api) in ~/.config/forge-bounties/credentials.env")
 }
 
 pub fn credential(name: &str) -> Result<Option<String>> {

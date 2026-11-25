@@ -1,7 +1,7 @@
 use crate::{
     model::{
-        self, Availability, Cache, DiscoveryCounts, Forge, Issue, RewardEvidence, SearchPage,
-        Status,
+        self, Availability, Cache, DiscoveryCounts, Forge, Issue, PublicRepository, RewardEvidence,
+        SearchPage, Status,
     },
     storage,
 };
@@ -343,12 +343,187 @@ impl Session<'_> {
         Ok(())
     }
 
+    fn discover_public_repositories(&mut self, budget: usize, reason: &str) -> Result<String> {
+        let mut counts = DiscoveryCounts::default();
+        let mut seen = HashSet::new();
+        let mut visited = HashSet::new();
+        let mut failures = Vec::new();
+        let mut catalog_pages = 0;
+        let mut issue_pages = 0;
+        let current_day = model::now() / DAY;
+        let catalog_requests =
+            if self.cache.progress[&self.forge].catalog_next.is_some() && budget >= 3 {
+                2
+            } else {
+                1
+            };
+        for pass in 0..budget {
+            let catalog = pass < catalog_requests;
+            let step = if catalog {
+                self.catalog_page(current_day, pass == 1)
+            } else {
+                let repos = self.cache.repositories.entry(self.forge).or_default();
+                let Some(repo) =
+                    select_repository(repos.values(), &visited, pass == catalog_requests).cloned()
+                else {
+                    break;
+                };
+                visited.insert(repo.path.clone());
+                self.repository_issue_page(&repo, &mut seen, &mut counts)
+            };
+            match step {
+                Ok(()) => {
+                    if catalog {
+                        catalog_pages += 1;
+                    } else {
+                        issue_pages += 1;
+                    }
+                    let message =
+                        format!("Anonymous repository discovery · {counts} · synchronizing");
+                    let status = self.cache.status.entry(self.forge).or_default();
+                    status.counts = counts.clone();
+                    status.message = message.clone();
+                    (self.commit)(self.cache, message)?;
+                }
+                Err(error) => {
+                    failures.push(error.to_string());
+                    if self.cache.status[&self.forge].retry_at > model::now() || !catalog {
+                        break;
+                    }
+                }
+            }
+        }
+        if catalog_pages == 0 && issue_pages == 0 && !failures.is_empty() {
+            return Err(anyhow!(
+                "Anonymous public repository discovery unavailable ({reason}): {}",
+                failures.join("; ")
+            ));
+        }
+        let progress = &self.cache.progress[&self.forge];
+        let repository_count = self
+            .cache
+            .repositories
+            .get(&self.forge)
+            .map_or(0, |repos| repos.len());
+        let catalog_state = if progress.catalog_next.is_some() {
+            "catalog continuation saved"
+        } else if catalog_pages == 0 {
+            "catalog not advanced"
+        } else {
+            "catalog page exhausted"
+        };
+        let errors = if failures.is_empty() {
+            String::new()
+        } else {
+            format!(" · {}", failures.join("; "))
+        };
+        Ok(format!(
+            "Anonymous repository discovery ({reason}) · partial coverage · {repository_count} indexed · {catalog_pages} catalog pages · {issue_pages} issue pages · {catalog_state} · {counts}{errors}"
+        ))
+    }
+
+    fn catalog_page(&mut self, today: u64, head_only: bool) -> Result<()> {
+        let progress = &self.cache.progress[&self.forge];
+        let day = if head_only {
+            today
+        } else {
+            progress.catalog_day.unwrap_or(today)
+        };
+        let base = repository_catalog(self.forge, day)?;
+        let url = if head_only {
+            base.clone()
+        } else {
+            progress
+                .catalog_next
+                .as_deref()
+                .map(|raw| checked_page_url(&base, raw))
+                .transpose()?
+                .unwrap_or_else(|| base.clone())
+        };
+        let (value, headers) = self
+            .get(url.clone(), None)?
+            .context("public repository catalog unavailable")?;
+        let entries = catalog_entries(self.forge, &value)?;
+        let next = next_page(self.forge, &base, &url, &headers)?;
+        let now = model::now();
+        let repositories = self.cache.repositories.entry(self.forge).or_default();
+        for entry in entries {
+            if let Some((path, activity)) = public_repository(self.forge, entry) {
+                repositories
+                    .entry(path.clone())
+                    .and_modify(|repo| {
+                        if activity > repo.activity {
+                            repo.activity = activity.clone();
+                        }
+                    })
+                    .or_insert_with(|| PublicRepository {
+                        path,
+                        activity,
+                        added_at: now,
+                        ..PublicRepository::default()
+                    });
+            }
+        }
+        if !head_only {
+            let progress = self.cache.progress.entry(self.forge).or_default();
+            progress.catalog_day = next.as_ref().map(|_| day);
+            progress.catalog_next = next.map(Into::into);
+        }
+        Ok(())
+    }
+
+    fn repository_issue_page(
+        &mut self,
+        repo: &PublicRepository,
+        seen: &mut HashSet<String>,
+        counts: &mut DiscoveryCounts,
+    ) -> Result<()> {
+        let base = repository_issues(self.forge, &repo.path)?;
+        let url = repo
+            .issue_next
+            .as_deref()
+            .map(|raw| checked_page_url(&base, raw))
+            .transpose()?
+            .unwrap_or_else(|| base.clone());
+        let response = self.get(url.clone(), None)?;
+        let next = if let Some((value, headers)) = response {
+            let entries = value.as_array().context("expected public issue list")?;
+            let mut page_seen = HashSet::new();
+            for issue in decode_page(self.forge, entries, seen, &mut page_seen, counts) {
+                counts.accepted_candidates += usize::from(issue.reward.is_some());
+                self.store_issue(Some(issue), None);
+            }
+            seen.extend(page_seen);
+            next_page(self.forge, &base, &url, &headers)?
+        } else {
+            // A removed or newly private repository contributes no current public results.
+            None
+        };
+        if let Some(repo) = self
+            .cache
+            .repositories
+            .entry(self.forge)
+            .or_default()
+            .get_mut(&repo.path)
+        {
+            repo.scanned_at = model::now();
+            repo.issue_next = next.map(Into::into);
+        }
+        Ok(())
+    }
+
     fn discover(&mut self, root: &Path, codeberg_token: Option<&str>) -> Result<String> {
         let token = match self.forge {
             Forge::GitHub => std::env::var("GITHUB_TOKEN").ok(),
-            Forge::GitLab => Some(storage::gitlab_token()?),
+            Forge::GitLab => storage::credential("GITLAB_TOKEN")?,
             Forge::Codeberg => codeberg_token.map(str::to_owned),
         };
+        if self.forge == Forge::GitLab && token.is_none() {
+            return self.discover_public_repositories(
+                SEARCH_REQUESTS_PER_CYCLE,
+                "GitLab global search requires authentication",
+            );
+        }
         let mut counts = DiscoveryCounts::default();
         let mut incomplete = false;
         let mut public_checks = 0;
@@ -423,6 +598,13 @@ impl Session<'_> {
             let result = self.get(url.clone(), if watching { None } else { token.as_deref() });
             let (mut value, headers) = match result {
                 Ok(Some(page)) => page,
+                result if self.forge == Forge::GitLab && global_unavailable(&result) => {
+                    return self.discover_public_repositories(
+                        SEARCH_REQUESTS_PER_CYCLE - pass - 1,
+                        "GitLab global issue search unavailable",
+                    );
+                }
+
                 result
                     if self.forge == Forge::Codeberg
                         && !watching
@@ -602,6 +784,85 @@ impl Session<'_> {
         };
         Ok(format!("{mode} · {counts}{coverage}"))
     }
+}
+
+fn select_repository<'a>(
+    repositories: impl Iterator<Item = &'a PublicRepository>,
+    visited: &HashSet<String>,
+    prefer_resume: bool,
+) -> Option<&'a PublicRepository> {
+    repositories
+        .filter(|repo| !visited.contains(&repo.path))
+        .min_by(|a, b| {
+            let priority =
+                |repo: &PublicRepository| match (prefer_resume, repo.issue_next.is_some()) {
+                    (true, true) | (false, false) => 0,
+                    _ => 1,
+                };
+            priority(a)
+                .cmp(&priority(b))
+                .then(a.scanned_at.cmp(&b.scanned_at))
+                .then_with(|| b.activity.cmp(&a.activity))
+                .then_with(|| a.path.cmp(&b.path))
+        })
+}
+
+fn repository_catalog(forge: Forge, _day: u64) -> Result<Url> {
+    ensure!(
+        forge == Forge::GitLab,
+        "public repository catalog unavailable"
+    );
+    let mut url = api(forge, &["projects"]);
+    url.query_pairs_mut()
+        .append_pair("page", "1")
+        .append_pair("per_page", &PAGE.to_string())
+        .append_pair("visibility", "public")
+        .append_pair("archived", "false")
+        .append_pair("with_issues_enabled", "true")
+        .append_pair("order_by", "last_activity_at")
+        .append_pair("sort", "desc");
+    Ok(url)
+}
+
+fn repository_issues(forge: Forge, path: &str) -> Result<Url> {
+    ensure!(
+        storage::valid_path(path) && path.contains('/'),
+        "invalid public repository path"
+    );
+    ensure!(
+        forge == Forge::GitLab,
+        "public repository issues unavailable"
+    );
+    let mut url = api(forge, &["projects", path, "issues"]);
+    url.query_pairs_mut()
+        .append_pair("page", "1")
+        .append_pair("per_page", &PAGE.to_string())
+        .append_pair("state", "opened")
+        .append_pair("order_by", "updated_at")
+        .append_pair("sort", "desc");
+    Ok(url)
+}
+
+fn catalog_entries(_forge: Forge, value: &Value) -> Result<&Vec<Value>> {
+    value.as_array().context("expected public repository array")
+}
+
+fn public_repository(forge: Forge, entry: &Value) -> Option<(String, String)> {
+    if forge != Forge::GitLab
+        || entry["archived"].as_bool() == Some(true)
+        || entry["visibility"]
+            .as_str()
+            .is_some_and(|visibility| visibility != "public")
+        || entry["issues_enabled"].as_bool() == Some(false)
+    {
+        return None;
+    }
+    let path = entry["path_with_namespace"].as_str()?;
+    if !storage::valid_path(path) || !path.contains('/') {
+        return None;
+    }
+    let activity = entry["last_activity_at"].as_str().unwrap_or_default();
+    Some((path.into(), activity.into()))
 }
 
 fn request_bucket(forge: Forge, url: &Url, authenticated: bool) -> &'static str {
@@ -1031,7 +1292,9 @@ fn search(forge: Forge, term: &str, page: usize, range: Option<[u64; 2]>) -> Url
 pub fn run(root: &Path, report: impl Fn(String) + Sync) -> Result<()> {
     let _lock = storage::lock(root)?;
     storage::prepare(root)?;
-    let cache = Mutex::new(storage::load(root)?);
+    let mut cache = storage::load(root)?;
+    storage::load_repository_index(root, &mut cache)?;
+    let cache = Mutex::new(cache);
     let client = Client::builder()
         .user_agent("forge-bounties/0.1")
         .redirect(reqwest::redirect::Policy::none())
@@ -1084,6 +1347,9 @@ fn run_forge(
                 .filter(|(_, issue)| issue.forge == forge)
                 .map(|(key, issue)| (key.clone(), issue.clone())),
         );
+        if let Some(repositories) = combined.repositories.get(&forge) {
+            cache.repositories.insert(forge, repositories.clone());
+        }
         cache
             .status
             .extend(combined.status.get(&forge).cloned().map(|s| (forge, s)));
@@ -1097,6 +1363,9 @@ fn run_forge(
             storage::commit_forge(root, &combined, local, forge)?;
             combined.issues.retain(|_, issue| issue.forge != forge);
             combined.issues.extend(local.issues.clone());
+            if let Some(repositories) = local.repositories.get(&forge) {
+                combined.repositories.insert(forge, repositories.clone());
+            }
             combined.status.extend(local.status.clone());
             combined.progress.extend(local.progress.clone());
         }
@@ -1169,6 +1438,61 @@ fn run_forge(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gitlab_anonymous_public_catalog_and_nested_project_issues() {
+        let catalog = repository_catalog(Forge::GitLab, 0).unwrap();
+        assert_eq!(catalog.path(), "/api/v4/projects");
+        assert!(
+            catalog
+                .query_pairs()
+                .any(|(k, v)| k == "visibility" && v == "public")
+        );
+        let project = serde_json::json!({"path_with_namespace":"group/sub/project","visibility":"public","last_activity_at":"2026-01-01"});
+        assert_eq!(
+            public_repository(Forge::GitLab, &project).unwrap().0,
+            "group/sub/project"
+        );
+        let issues = repository_issues(Forge::GitLab, "group/sub/project").unwrap();
+        assert_eq!(
+            issues.path(),
+            "/api/v4/projects/group%2Fsub%2Fproject/issues"
+        );
+        assert!(
+            public_repository(
+                Forge::GitLab,
+                &serde_json::json!({"path_with_namespace":"g/p","visibility":"private"})
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn repository_scan_resumes_and_prioritizes_active_repositories() {
+        let active = PublicRepository {
+            path: "x/active".into(),
+            activity: "2026".into(),
+            ..Default::default()
+        };
+        let old = PublicRepository {
+            path: "x/old".into(),
+            activity: "2025".into(),
+            issue_next: Some("page 2".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            select_repository([&old, &active].into_iter(), &HashSet::new(), false)
+                .unwrap()
+                .path,
+            "x/active"
+        );
+        assert_eq!(
+            select_repository([&old, &active].into_iter(), &HashSet::new(), true)
+                .unwrap()
+                .path,
+            "x/old"
+        );
+    }
 
     #[test]
     fn rate_limits_isolate_github_search_and_honor_server_backoff() {
