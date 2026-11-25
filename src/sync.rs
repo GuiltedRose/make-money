@@ -25,6 +25,28 @@ const CHECKS: usize = 8;
 const GITLAB_PUBLIC_CHECKS: usize = 18;
 const TERMS: [&str; 3] = ["bounty", "reward", "payout"];
 
+const GITHUB_TERMS: &[&str] = &[
+    "bounty",
+    "reward",
+    "payout",
+    "label:bounty",
+    r#"label:"paid issue""#,
+    r#""paid issue""#,
+    r#""algora.io""#,
+    r#""polar.sh""#,
+    r#""issuehunt.io""#,
+    r#""bountysource.com""#,
+    r#""reverse engineering" bounty"#,
+];
+
+fn discovery_terms(forge: Forge) -> &'static [&'static str] {
+    if forge == Forge::GitHub {
+        GITHUB_TERMS
+    } else {
+        &TERMS
+    }
+}
+
 #[derive(Deserialize)]
 struct Remote {
     id: Option<u64>,
@@ -320,21 +342,22 @@ impl Session<'_> {
         let mut public_checks = 0;
         let mut seen = HashSet::new();
         let mut completed = HashSet::new();
+        let terms = discovery_terms(self.forge);
         let mut term_index =
-            self.cache.progress.entry(self.forge).or_default().next_term % TERMS.len();
+            self.cache.progress.entry(self.forge).or_default().next_term % terms.len();
 
         for _ in 0..SEARCH_REQUESTS_PER_CYCLE {
-            for _ in 0..TERMS.len() {
-                if !completed.contains(TERMS[term_index]) {
+            for _ in 0..terms.len() {
+                if !completed.contains(terms[term_index]) {
                     break;
                 }
-                term_index = (term_index + 1) % TERMS.len();
+                term_index = (term_index + 1) % terms.len();
             }
-            if completed.len() == TERMS.len() {
+            if completed.len() == terms.len() {
                 break;
             }
-            let term = TERMS[term_index];
-            term_index = (term_index + 1) % TERMS.len();
+            let term = terms[term_index];
+            term_index = (term_index + 1) % terms.len();
             let progress = self.cache.progress.entry(self.forge).or_default();
             let task = progress
                 .terms
@@ -458,7 +481,7 @@ impl Session<'_> {
 
         let progress = self.cache.progress.entry(self.forge).or_default();
         let mut reasons = Vec::new();
-        if completed.len() != TERMS.len() {
+        if completed.len() != terms.len() {
             reasons.push("continuation saved for the next cycle");
         }
         if incomplete {
@@ -799,6 +822,24 @@ fn run_forge(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn targeted_github_queries_keep_public_issue_scope() {
+        for term in [
+            "label:bounty",
+            r#"label:"paid issue""#,
+            r#""algora.io""#,
+            r#""reverse engineering" bounty"#,
+        ] {
+            assert!(discovery_terms(Forge::GitHub).contains(&term));
+            assert!(!discovery_terms(Forge::GitLab).contains(&term));
+            let url = search(Forge::GitHub, term, 1, None);
+            assert!(url.query_pairs().any(|(k, v)| k == "q"
+                && v.contains(term)
+                && v.contains("is:public")
+                && v.contains("is:issue")));
+        }
+    }
 
     #[test]
     fn malformed_entries_do_not_discard_valid_neighbors() {
