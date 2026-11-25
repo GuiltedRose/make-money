@@ -104,13 +104,14 @@ static REVERSING: LazyLock<Regex> = LazyLock::new(|| {
 });
 
 static DECLARATION: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)^(?:bounty(?: amount)?|cash reward|reward|payout|paid issue|prize|compensation)(?:\s*[:=–—-]\s*|\s+|$)").unwrap()
+    Regex::new(r"(?i)^(?:bounty(?: amount)?|cash reward|reward|payout|paid issue|prize|compensation)(?:\s*[:=–—]\s*|\s*-\s+|\s+|$)").unwrap()
 });
 static AMOUNT: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?i)^(?:(US\$|CA\$|AU\$|NZ\$|\$|USD|EUR|GBP|CAD|AUD|NZD|CHF|€|£)\s*)?((?:[0-9]{1,9}|[0-9]{1,3}(?:,[0-9]{3}){1,2})(?:\.[0-9]{1,2})?)\s*(USD|EUR|GBP|CAD|AUD|NZD|CHF)?$").unwrap()
 });
-static AMOUNT_FIRST: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"(?i)^(.+?)\s+(?:bounty|reward|payout)$").unwrap());
+static AMOUNT_FIRST: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)^((?:[0-9$€£+-]|(?:US|CA|AU|NZ)\$|(?:USD|EUR|GBP|CAD|AUD|NZD|CHF)\b).+?)\s+(?:bounty|reward|payout)$").unwrap()
+});
 
 #[derive(Debug, PartialEq)]
 pub enum RewardEvidence {
@@ -164,7 +165,11 @@ fn parse_amount(text: &str) -> Option<(&'static str, u64)> {
 }
 
 fn declaration(line: &str) -> Option<String> {
-    let line = line.trim();
+    let line = line
+        .trim()
+        .trim_start_matches('💎')
+        .trim_start_matches('\u{fe0f}')
+        .trim_start();
     let line = line
         .strip_prefix("- ")
         .or_else(|| line.strip_prefix("* "))
@@ -363,6 +368,7 @@ mod tests {
             ("[Bounty CA$250] Fix it", ("CAD", 25000)),
             ("| Bounty | EUR 125.50 |", ("EUR", 12550)),
             ("£75 reward", ("GBP", 7500)),
+            ("💎 $50 bounty", ("$", 5000)),
             ("Paid issue: 150 AUD", ("AUD", 15000)),
         ] {
             let r = reward(input, "", &[]).unwrap();
@@ -380,6 +386,20 @@ mod tests {
         assert_eq!(
             reward_evidence("Reward: €200 USD", "", &[]),
             RewardEvidence::Ambiguous
+        );
+    }
+
+    #[test]
+    fn rejects_signed_amounts_without_confusing_issue_numbers_with_rewards() {
+        assert_eq!(
+            reward_evidence("Bounty -100 USD", "", &[]),
+            RewardEvidence::Ambiguous
+        );
+        assert_eq!(
+            reward("Fix issue 123 with a bounty", "Reward: EUR 50", &[])
+                .unwrap()
+                .cents,
+            5000
         );
     }
 
