@@ -103,60 +103,141 @@ static REVERSING: LazyLock<Regex> = LazyLock::new(|| {
     .expect("valid reverse engineering regex")
 });
 
-static OFFER: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(
-    r"(?i)^\s*(?:[-*]\s+)?(?:\*\*)?\[?(?:bounty|reward|payout)(?:\*\*)?\]?\s*[:=–—-]?\s*(?:\*\*)?\s*(?:(US\$|\$|USD|EUR|€|GBP|£)\s*)?((?:[0-9]{1,9}|[0-9]{1,3}(?:,[0-9]{3}){1,2})(?:\.[0-9]{1,2})?)\s*(USD|EUR|GBP)?\s*(?:\*\*)?\s*\]?\s*$"
-).expect("valid reward regex")
+static DECLARATION: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)^(?:bounty(?: amount)?|cash reward|reward|payout|paid issue|prize|compensation)(?:\s*[:=–—-]\s*|\s+|$)").unwrap()
 });
+static AMOUNT: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)^(?:(US\$|CA\$|AU\$|NZ\$|\$|USD|EUR|GBP|CAD|AUD|NZD|CHF|€|£)\s*)?((?:[0-9]{1,9}|[0-9]{1,3}(?:,[0-9]{3}){1,2})(?:\.[0-9]{1,2})?)\s*(USD|EUR|GBP|CAD|AUD|NZD|CHF)?$").unwrap()
+});
+static AMOUNT_FIRST: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)^(.+?)\s+(?:bounty|reward|payout)$").unwrap());
 
-pub fn reward(title: &str, body: &str, labels: &[String]) -> Option<Reward> {
-    let mut result: Option<Reward> = None;
+#[derive(Debug, PartialEq)]
+pub enum RewardEvidence {
+    Missing,
+    Ambiguous,
+    Stated(Reward),
+}
+
+impl RewardEvidence {
+    pub fn into_reward(self) -> Option<Reward> {
+        match self {
+            Self::Stated(reward) => Some(reward),
+            _ => None,
+        }
+    }
+}
+
+fn parse_amount(text: &str) -> Option<(&'static str, u64)> {
+    let m = AMOUNT.captures(text)?;
+    let currency = |text: &str| match text.to_ascii_uppercase().as_str() {
+        "US$" | "USD" => "USD",
+        "€" | "EUR" => "EUR",
+        "£" | "GBP" => "GBP",
+        "CA$" | "CAD" => "CAD",
+        "AU$" | "AUD" => "AUD",
+        "NZ$" | "NZD" => "NZD",
+        "CHF" => "CHF",
+        _ => "$",
+    };
+    let prefix = m.get(1).map(|v| currency(v.as_str()));
+    let suffix = m.get(3).map(|v| currency(v.as_str()));
+    let currency = match (prefix, suffix) {
+        (Some("$"), Some("USD")) => "USD",
+        (Some(prefix), Some(suffix)) if prefix == suffix => prefix,
+        (Some(currency), None) | (None, Some(currency)) => currency,
+        _ => return None,
+    };
+    let amount = m[2].replace(',', "");
+    let (whole, fraction) = amount.split_once('.').unwrap_or((&amount, ""));
+    let fraction = match fraction.len() {
+        0 => 0,
+        1 => fraction.parse::<u64>().ok()? * 10,
+        _ => fraction.parse::<u64>().ok()?,
+    };
+    let cents = whole
+        .parse::<u64>()
+        .ok()?
+        .checked_mul(100)?
+        .checked_add(fraction)?;
+    (cents != 0).then_some((currency, cents))
+}
+
+fn declaration(line: &str) -> Option<String> {
+    let line = line.trim();
+    let line = line
+        .strip_prefix("- ")
+        .or_else(|| line.strip_prefix("* "))
+        .unwrap_or(line);
+    let line = line
+        .replace("**", "")
+        .replace("__", "")
+        .replace('`', "")
+        .replace("] ", " ");
+    let line = line.trim_matches(|c: char| c == '[' || c == ']' || c.is_whitespace());
+    if let Some((label, amount)) = line.trim_matches('|').split_once('|') {
+        let label = label.trim();
+        if DECLARATION
+            .find(label)
+            .is_some_and(|m| m.end() == label.len())
+        {
+            return Some(amount.trim().into());
+        }
+    }
+    if let Some(label) = DECLARATION.find(line) {
+        return Some(line[label.end()..].trim().into());
+    }
+    AMOUNT_FIRST.captures(line).map(|m| m[1].into())
+}
+
+pub fn reward_evidence(title: &str, body: &str, labels: &[String]) -> RewardEvidence {
     let title_offer = title
         .strip_prefix('[')
         .and_then(|s| s.split_once(']'))
         .map(|(offer, _)| offer);
+    let mut fenced = None;
+    let lines = body.lines().filter(|line| {
+        let text = line.trim_start();
+        if let Some(marker) = ["```", "~~~"]
+            .into_iter()
+            .find(|marker| text.starts_with(marker))
+        {
+            if fenced == Some(marker) {
+                fenced = None;
+            } else if fenced.is_none() {
+                fenced = Some(marker);
+            }
+            return false;
+        }
+        fenced.is_none() && !text.starts_with('>')
+    });
+    let mut result: Option<Reward> = None;
     for line in std::iter::once(title)
         .chain(title_offer)
         .chain(labels.iter().map(String::as_str))
-        .chain(body.lines())
+        .chain(lines)
     {
-        let Some(m) = OFFER.captures(line.trim().trim_start_matches("**")) else {
+        let Some(amount) = declaration(line) else {
             continue;
         };
-        let prefix = m
-            .get(1)
-            .map(|v| match v.as_str().to_ascii_uppercase().as_str() {
-                "€" | "EUR" => "EUR",
-                "£" | "GBP" => "GBP",
-                "$" => "",
-                _ => "USD",
-            });
-        let suffix = m.get(3).map(|v| v.as_str().to_ascii_uppercase());
-        let currency = match (prefix, suffix.as_deref()) {
-            (Some(""), Some("USD")) => "USD",
-            (Some(""), None) => "$",
-            (Some(value), None) if !value.is_empty() => value,
-            (Some(value), Some(other)) if value == other => value,
-            (None, Some(value)) => value,
-            _ => continue,
-        };
-        let amount = m[2].replace(',', "");
-        let (whole, fraction) = amount.split_once('.').unwrap_or((&amount, ""));
-        let whole = whole.parse::<u64>().ok()?.checked_mul(100)?;
-        let fraction = match fraction.len() {
-            0 => 0,
-            1 => fraction.parse::<u64>().ok()? * 10,
-            _ => fraction.parse::<u64>().ok()?,
-        };
-        let cents = whole + fraction;
-        if cents == 0 {
+        let Some((currency, cents)) = parse_amount(&amount) else {
+            if amount.bytes().any(|c| c.is_ascii_digit()) {
+                if line == title
+                    && title_offer.is_some_and(|offer| {
+                        declaration(offer).is_some_and(|amount| parse_amount(&amount).is_some())
+                    })
+                {
+                    continue;
+                }
+                return RewardEvidence::Ambiguous;
+            }
             continue;
-        }
+        };
         if result
             .as_ref()
-            .is_some_and(|r| r.currency != currency || r.cents != cents)
+            .is_some_and(|r| r.cents != cents || r.currency != currency)
         {
-            return None;
+            return RewardEvidence::Ambiguous;
         }
         result = Some(Reward {
             currency: currency.into(),
@@ -164,7 +245,11 @@ pub fn reward(title: &str, body: &str, labels: &[String]) -> Option<Reward> {
             evidence: line.trim().into(),
         });
     }
-    result
+    result.map_or(RewardEvidence::Missing, RewardEvidence::Stated)
+}
+
+pub fn reward(title: &str, body: &str, labels: &[String]) -> Option<Reward> {
+    reward_evidence(title, body, labels).into_reward()
 }
 
 #[derive(Clone, Default, Serialize, Deserialize)]
@@ -227,6 +312,32 @@ mod tests {
             assert!(reward("", text, &[]).is_none(), "{text}");
         }
         assert!(reward("", "Reward: EUR 100\nReward: EUR 200", &[]).is_none());
+    }
+
+    #[test]
+    fn parses_tables_and_explicit_currency_variants() {
+        for (input, expected) in [
+            ("[Bounty CA$250] Fix it", ("CAD", 25000)),
+            ("| Bounty | EUR 125.50 |", ("EUR", 12550)),
+            ("£75 reward", ("GBP", 7500)),
+            ("Paid issue: 150 AUD", ("AUD", 15000)),
+        ] {
+            let r = reward(input, "", &[]).unwrap();
+            assert_eq!((r.currency.as_str(), r.cents), expected);
+        }
+    }
+
+    #[test]
+    fn distinguishes_missing_and_ambiguous_amounts() {
+        assert_eq!(reward_evidence("Bounty", "", &[]), RewardEvidence::Missing);
+        assert_eq!(
+            reward_evidence("Bounty: $100–$200", "", &[]),
+            RewardEvidence::Ambiguous
+        );
+        assert_eq!(
+            reward_evidence("Reward: €200 USD", "", &[]),
+            RewardEvidence::Ambiguous
+        );
     }
 
     #[test]
