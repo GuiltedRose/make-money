@@ -147,8 +147,48 @@ static AMOUNT_FIRST: LazyLock<Regex> = LazyLock::new(|| {
 #[derive(Debug, PartialEq)]
 pub enum RewardEvidence {
     Missing,
-    Ambiguous,
+    Ambiguous(Vec<RewardRejection>),
     Stated(Reward),
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct RewardDeclaration {
+    pub original: String,
+    pub normalized: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct RewardRejection {
+    pub declaration: RewardDeclaration,
+    pub reason: RewardFailure,
+    pub conflicts: Vec<RewardDeclaration>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RewardFailure {
+    UnsupportedFormatting,
+    MissingCurrency,
+    ConflictingCurrency,
+    ConflictingAmount,
+    RewardRange,
+    AlternativePaymentOptions,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum Diagnostic {
+    AmbiguousReward {
+        forge: Forge,
+        issue_url: String,
+        issue_title: String,
+        rejection: RewardRejection,
+    },
+    InvalidIssue {
+        forge: Forge,
+        issue_url: Option<String>,
+        error: String,
+    },
 }
 
 impl RewardEvidence {
@@ -160,9 +200,8 @@ impl RewardEvidence {
     }
 }
 
-fn parse_amount(text: &str) -> Option<(&'static str, u64, Option<String>)> {
-    let m = AMOUNT.captures(text)?;
-    let currency = |text: &str| match text.to_ascii_uppercase().as_str() {
+fn currency(text: &str) -> &'static str {
+    match text.to_ascii_uppercase().as_str() {
         "US$" | "USD" => "USD",
         "€" | "EUR" => "EUR",
         "£" | "GBP" => "GBP",
@@ -176,7 +215,11 @@ fn parse_amount(text: &str) -> Option<(&'static str, u64, Option<String>)> {
         "ETH" => "ETH",
         "BTC" => "BTC",
         _ => "$",
-    };
+    }
+}
+
+fn parse_amount(text: &str) -> Option<(&'static str, u64, Option<String>)> {
+    let m = AMOUNT.captures(text)?;
     let prefix = m.get(1).map(|v| currency(v.as_str()));
     let suffix = m.get(3).map(|v| currency(v.as_str()));
     let currency = match (prefix, suffix) {
@@ -237,6 +280,35 @@ fn declaration(line: &str) -> Option<String> {
     AMOUNT_FIRST.captures(line).map(|m| m[1].into())
 }
 
+static RANGE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)[0-9][^0-9]*(?:[–—-]|\bto\b)[^0-9]*[0-9]|^\s*(?:up to|between)\b").unwrap()
+});
+static ALTERNATIVE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)\b(?:or|either|alternatively)\b|[0-9][^0-9]*/[^0-9]*[0-9]").unwrap()
+});
+
+fn classify_amount_failure(amount: &str) -> RewardFailure {
+    if ALTERNATIVE.is_match(amount) {
+        return RewardFailure::AlternativePaymentOptions;
+    }
+    if RANGE.is_match(amount) {
+        return RewardFailure::RewardRange;
+    }
+    if let Some(parts) = AMOUNT.captures(amount) {
+        match (parts.get(1), parts.get(3)) {
+            (None, None) => return RewardFailure::MissingCurrency,
+            (Some(prefix), Some(suffix))
+                if currency(prefix.as_str()) != currency(suffix.as_str())
+                    && !(prefix.as_str() == "$" && currency(suffix.as_str()) == "USD") =>
+            {
+                return RewardFailure::ConflictingCurrency;
+            }
+            _ => {}
+        }
+    }
+    RewardFailure::UnsupportedFormatting
+}
+
 pub fn reward_evidence(title: &str, body: &str, labels: &[String]) -> RewardEvidence {
     let title_offer = title
         .strip_prefix('[')
@@ -258,7 +330,8 @@ pub fn reward_evidence(title: &str, body: &str, labels: &[String]) -> RewardEvid
         }
         fenced.is_none() && !text.starts_with('>')
     });
-    let mut result: Option<Reward> = None;
+    let mut result: Option<(Reward, RewardDeclaration)> = None;
+    let mut rejections = Vec::new();
     for line in std::iter::once(title)
         .chain(title_offer)
         .chain(labels.iter().map(String::as_str))
@@ -276,7 +349,14 @@ pub fn reward_evidence(title: &str, body: &str, labels: &[String]) -> RewardEvid
                 {
                     continue;
                 }
-                return RewardEvidence::Ambiguous;
+                rejections.push(RewardRejection {
+                    reason: classify_amount_failure(&amount),
+                    declaration: RewardDeclaration {
+                        original: line.into(),
+                        normalized: amount,
+                    },
+                    conflicts: Vec::new(),
+                });
             }
             continue;
         };
@@ -286,14 +366,36 @@ pub fn reward_evidence(title: &str, body: &str, labels: &[String]) -> RewardEvid
             crypto_decimal,
             evidence: line.trim().into(),
         };
-        if result.as_ref().is_some_and(|previous| {
-            previous.currency != currency || previous.scaled() != reward.scaled()
-        }) {
-            return RewardEvidence::Ambiguous;
+        let declaration = RewardDeclaration {
+            original: line.into(),
+            normalized: amount,
+        };
+        if let Some((previous, prior)) = &result {
+            let reason = if previous.currency != currency {
+                Some(RewardFailure::ConflictingCurrency)
+            } else if previous.scaled() != reward.scaled() {
+                Some(RewardFailure::ConflictingAmount)
+            } else {
+                None
+            };
+            if let Some(reason) = reason {
+                rejections.push(RewardRejection {
+                    declaration,
+                    reason,
+                    conflicts: vec![prior.clone()],
+                });
+                continue;
+            }
         }
-        result = Some(reward);
+        result = Some((reward, declaration));
     }
-    result.map_or(RewardEvidence::Missing, RewardEvidence::Stated)
+    if rejections.is_empty() {
+        result.map_or(RewardEvidence::Missing, |(reward, _)| {
+            RewardEvidence::Stated(reward)
+        })
+    } else {
+        RewardEvidence::Ambiguous(rejections)
+    }
 }
 
 #[cfg(test)]
@@ -388,6 +490,8 @@ pub struct Cache {
     pub progress: BTreeMap<Forge, SearchProgress>,
     #[serde(skip)]
     pub repositories: BTreeMap<Forge, BTreeMap<String, PublicRepository>>,
+    #[serde(skip)]
+    pub diagnostics: Vec<Diagnostic>,
 }
 
 pub fn now() -> u64 {
@@ -441,22 +545,22 @@ mod tests {
     #[test]
     fn distinguishes_missing_and_ambiguous_amounts() {
         assert_eq!(reward_evidence("Bounty", "", &[]), RewardEvidence::Missing);
-        assert_eq!(
+        assert!(matches!(
             reward_evidence("Bounty: $100–$200", "", &[]),
-            RewardEvidence::Ambiguous
-        );
-        assert_eq!(
+            RewardEvidence::Ambiguous(_)
+        ));
+        assert!(matches!(
             reward_evidence("Reward: €200 USD", "", &[]),
-            RewardEvidence::Ambiguous
-        );
+            RewardEvidence::Ambiguous(_)
+        ));
     }
 
     #[test]
     fn rejects_signed_amounts_without_confusing_issue_numbers_with_rewards() {
-        assert_eq!(
+        assert!(matches!(
             reward_evidence("Bounty -100 USD", "", &[]),
-            RewardEvidence::Ambiguous
-        );
+            RewardEvidence::Ambiguous(_)
+        ));
         assert_eq!(
             reward("Fix issue 123 with a bounty", "Reward: EUR 50", &[])
                 .unwrap()
@@ -476,6 +580,34 @@ mod tests {
         );
         assert!(reward("Bounty: 0.5 BTC or 8 SOL", "", &[]).is_none());
         assert!(reward("Bounty: USD 1.001", "", &[]).is_none());
+    }
+
+    #[test]
+    fn rejected_rewards_report_original_text_and_specific_reasons() {
+        for (input, expected) in [
+            ("- **Reward:** 250", RewardFailure::MissingCurrency),
+            ("Reward: €250 USD", RewardFailure::ConflictingCurrency),
+            ("Reward: $50–$100", RewardFailure::RewardRange),
+            (
+                "Reward: USD 100 or 3 SOL",
+                RewardFailure::AlternativePaymentOptions,
+            ),
+            ("Reward: USD 12,34", RewardFailure::UnsupportedFormatting),
+        ] {
+            let RewardEvidence::Ambiguous(rejections) = reward_evidence("", input, &[]) else {
+                panic!("expected rejection for {input}");
+            };
+            assert_eq!(rejections[0].declaration.original, input);
+            assert_eq!(rejections[0].reason, expected);
+        }
+        let RewardEvidence::Ambiguous(rejections) =
+            reward_evidence("", "Reward: USD 250\nBounty: USD 500", &[])
+        else {
+            panic!("expected a conflicting amount");
+        };
+        assert_eq!(rejections[0].reason, RewardFailure::ConflictingAmount);
+        assert_eq!(rejections[0].declaration.normalized, "USD 500");
+        assert_eq!(rejections[0].conflicts[0].original, "Reward: USD 250");
     }
 
     #[test]

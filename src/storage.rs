@@ -1,9 +1,9 @@
-use crate::model::{Cache, Forge, Issue, PublicRepository, SearchProgress, Status};
+use crate::model::{Cache, Diagnostic, Forge, Issue, PublicRepository, SearchProgress, Status};
 use anyhow::{Context, Result, ensure};
 use rusqlite::{Connection, OpenFlags, Transaction, params};
 use std::{
     fs::{self, File},
-    io::BufReader,
+    io::{BufReader, Write},
     path::{Path, PathBuf},
     time::Duration,
 };
@@ -110,6 +110,44 @@ const CREATE_REPOSITORIES: &str = "CREATE TABLE IF NOT EXISTS public_repositorie
          PRIMARY KEY (forge, path)
      )";
 
+const CREATE_DIAGNOSTICS: &str = "CREATE TABLE IF NOT EXISTS discovery_diagnostics (
+    evidence TEXT PRIMARY KEY NOT NULL,
+    first_seen INTEGER NOT NULL,
+    last_seen INTEGER NOT NULL,
+    observations INTEGER NOT NULL
+)";
+
+pub fn write_diagnostics(root: &Path, mut output: impl Write) -> Result<()> {
+    let path = root.join(DATABASE);
+    if !path.try_exists()? {
+        return Ok(());
+    }
+    let db = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    db.busy_timeout(Duration::from_secs(2))?;
+    let table_exists: bool = db.query_row(
+        "SELECT EXISTS (SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'discovery_diagnostics')",
+        [], |row| row.get(0),
+    )?;
+    if !table_exists {
+        return Ok(());
+    }
+    let mut query = db.prepare(
+        "SELECT evidence, first_seen, last_seen, observations
+         FROM discovery_diagnostics ORDER BY last_seen DESC, evidence",
+    )?;
+    let mut rows = query.query([])?;
+    while let Some(row) = rows.next()? {
+        let evidence: String = row.get(0)?;
+        let mut value: serde_json::Value = serde_json::from_str(&evidence)?;
+        value["first_seen"] = row.get::<_, u64>(1)?.into();
+        value["last_seen"] = row.get::<_, u64>(2)?.into();
+        value["observations"] = row.get::<_, u64>(3)?.into();
+        serde_json::to_writer(&mut output, &value)?;
+        output.write_all(b"\n")?;
+    }
+    Ok(())
+}
+
 fn put_issue(tx: &Transaction<'_>, key: &str, issue: &Issue) -> Result<()> {
     tx.execute(
         "INSERT INTO issues (issue_key, data) VALUES (?1, ?2)
@@ -144,6 +182,7 @@ pub fn prepare(root: &Path) -> Result<()> {
         let db = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_WRITE)?;
         db.busy_timeout(Duration::from_secs(2))?;
         db.execute_batch(CREATE_REPOSITORIES)?;
+        db.execute_batch(CREATE_DIAGNOSTICS)?;
         return Ok(());
     }
     let cache = legacy(root)?;
@@ -160,6 +199,7 @@ pub fn prepare(root: &Path) -> Result<()> {
          CREATE TABLE forge_state (forge TEXT PRIMARY KEY NOT NULL, status TEXT, progress TEXT);",
     )?;
     tx.execute_batch(CREATE_REPOSITORIES)?;
+    tx.execute_batch(CREATE_DIAGNOSTICS)?;
     for (key, issue) in &cache.issues {
         put_issue(&tx, key, issue)?;
     }
@@ -179,7 +219,13 @@ pub fn prepare(root: &Path) -> Result<()> {
     Ok(())
 }
 
-pub fn commit_forge(root: &Path, previous: &Cache, local: &Cache, forge: Forge) -> Result<()> {
+pub fn commit_forge(
+    root: &Path,
+    previous: &Cache,
+    local: &Cache,
+    forge: Forge,
+    diagnostics: &[Diagnostic],
+) -> Result<()> {
     let mut db =
         Connection::open_with_flags(root.join(DATABASE), OpenFlags::SQLITE_OPEN_READ_WRITE)?;
     db.busy_timeout(Duration::from_secs(2))?;
@@ -212,6 +258,16 @@ pub fn commit_forge(root: &Path, previous: &Cache, local: &Cache, forge: Forge) 
                 )?;
             }
         }
+    }
+    let now = crate::model::now();
+    for evidence in diagnostics {
+        tx.execute(
+            "INSERT INTO discovery_diagnostics (evidence, first_seen, last_seen, observations)
+             VALUES (?1, ?2, ?2, 1)
+             ON CONFLICT(evidence) DO UPDATE SET last_seen = excluded.last_seen,
+                 observations = discovery_diagnostics.observations + 1",
+            params![serde_json::to_string(evidence)?, now],
+        )?;
     }
     tx.commit()?;
     Ok(())
@@ -319,7 +375,7 @@ mod tests {
                 .entry(forge)
                 .or_default()
                 .insert(repo.path.clone(), repo);
-            commit_forge(&root, &Cache::default(), &cache, forge)?;
+            commit_forge(&root, &Cache::default(), &cache, forge, &[])?;
             let mut loaded = load(&root)?;
             load_repository_index(&root, &mut loaded)?;
             assert!(

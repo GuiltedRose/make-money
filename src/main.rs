@@ -481,6 +481,9 @@ fn main() -> Result<()> {
             println!("{}", serde_json::to_string_pretty(&cache.status)?);
             Ok(())
         }
+        [arg] if arg == "--diagnostics" => {
+            storage::write_diagnostics(&root, std::io::stdout().lock())
+        }
         [arg] if arg == "--export-legacy" => {
             let mut cache = storage::load(&root)?;
             cache.issues = cache
@@ -492,9 +495,13 @@ fn main() -> Result<()> {
             Ok(())
         }
         [arg] if arg == "--help" => {
-            println!("forge-bounties [--sync | --status | --export-legacy | --help]");
+            println!(
+                "forge-bounties [--sync | --status | --diagnostics | --export-legacy | --help]"
+            );
             Ok(())
         }
-        _ => bail!("usage: forge-bounties [--sync | --status | --export-legacy | --help]"),
+        _ => bail!(
+            "usage: forge-bounties [--sync | --status | --diagnostics | --export-legacy | --help]"
+        ),
     }
 }

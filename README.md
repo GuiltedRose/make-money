@@ -71,6 +71,10 @@ journalctl --user -u forge-bounties.service -n 30 --no-pager
 "$HOME/.local/bin/forge-bounties" --status
 ```
 
+## Inspect rejected rewards offline
+
+Run `forge-bounties --diagnostics` to export newline-delimited JSON from the local SQLite cache. The export contains original and normalized reward evidence, the rejection reason, conflicting declarations where available, and GitLab issue decoding errors. Identical observations are grouped with first-seen and last-seen timestamps and a count. Previous versions retained only aggregate rejection counts. Detailed evidence is captured starting with the first refresh after upgrade. Authenticated search candidates contribute reward evidence only after anonymous verification.
+
 ## Recovery and rollback
 
 A failed source leaves cached issues available, with a status message and any recorded retry time. Inspect `--status` and the journal, correct the configuration or wait for the cooldown, then start the service again. The GUI and timer share a file lock. Each completed page and its continuation commit in one SQLite transaction. Back up `cache.sqlite3` after stopping refreshes. Preserve the original `cache.json` if present. If the cache cannot be decoded, stop refreshes and preserve the damaged copy before restoring a known-good backup.
