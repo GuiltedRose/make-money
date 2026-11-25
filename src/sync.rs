@@ -22,6 +22,8 @@ const SEARCH_REQUESTS_PER_CYCLE: usize = 6;
 const RECENT_REQUESTS_PER_CYCLE: usize = 3;
 const GITLAB_HISTORY_PAGE: usize = 9;
 const GITLAB_RECENT_PAGE: usize = 3;
+const CODEBERG_AUTH_RECHECKS: usize = 2;
+const CODEBERG_AUTH_PUBLIC_CHECKS: usize = CHECKS - CODEBERG_AUTH_RECHECKS;
 const GITHUB_PAGE_SIZE: usize = 100;
 const GITHUB_MAX_PAGE: usize = 1000 / GITHUB_PAGE_SIZE;
 const CHECKS: usize = 8;
@@ -216,7 +218,15 @@ impl Session<'_> {
         );
         let mut request = self.client.get(url).header("Accept", "application/json");
         if let Some(token) = token {
-            request = request.bearer_auth(token);
+            request = if self.forge == Forge::Codeberg {
+                let mut authorization =
+                    reqwest::header::HeaderValue::from_str(&format!("token {token}"))
+                        .context("invalid Codeberg token format")?;
+                authorization.set_sensitive(true);
+                request.header(reqwest::header::AUTHORIZATION, authorization)
+            } else {
+                request.bearer_auth(token)
+            };
         }
         let response = request.send().map_err(reqwest::Error::without_url)?;
         let headers = response.headers().clone();
@@ -316,7 +326,7 @@ impl Session<'_> {
         }
     }
 
-    fn recheck(&mut self) -> Result<()> {
+    fn recheck(&mut self, limit: usize) -> Result<()> {
         let mut queue: Vec<_> = self
             .cache
             .issues
@@ -324,7 +334,7 @@ impl Session<'_> {
             .map(|(key, issue)| (issue.checked, key.clone(), issue.url.clone()))
             .collect();
         queue.sort_unstable();
-        for (_, key, url) in queue.into_iter().take(CHECKS) {
+        for (_, key, url) in queue.into_iter().take(limit) {
             let (_, endpoint) = issue_url(self.forge, &url)?;
             // Public-only detail reads preserve the discovery visibility boundary.
             match self.get(endpoint, None)? {
@@ -343,11 +353,11 @@ impl Session<'_> {
         Ok(())
     }
 
-    fn discover(&mut self) -> Result<String> {
+    fn discover(&mut self, root: &Path, codeberg_token: Option<&str>) -> Result<String> {
         let token = match self.forge {
             Forge::GitHub => std::env::var("GITHUB_TOKEN").ok(),
             Forge::GitLab => Some(storage::gitlab_token()?),
-            Forge::Codeberg => None,
+            Forge::Codeberg => codeberg_token.map(str::to_owned),
         };
         let mut counts = DiscoveryCounts::default();
         let mut incomplete = false;
@@ -359,10 +369,20 @@ impl Session<'_> {
         let mut term_index = progress.next_term % terms.len();
         let mut recent_index = progress.next_recent;
         let today = model::now() / DAY;
+        let mut watchlist = Vec::new();
+        let mut watch_reason = None;
+        let mut watch_index = progress.next_watch;
 
         for pass in 0..SEARCH_REQUESTS_PER_CYCLE {
-            let recent = pass < RECENT_REQUESTS_PER_CYCLE;
-            let term = if recent {
+            let watching = !watchlist.is_empty();
+            let recent = !watching && pass < RECENT_REQUESTS_PER_CYCLE;
+            let mut watch_repo = None;
+            let term = if watching {
+                let index = watch_index % (watchlist.len() * TERMS.len());
+                watch_index = index + 1;
+                watch_repo = Some(watchlist[index / TERMS.len()].as_str());
+                TERMS[index % TERMS.len()]
+            } else if recent {
                 let (term, next) = recent_term(terms, pass, recent_index);
                 recent_index = next;
                 term
@@ -377,29 +397,69 @@ impl Session<'_> {
                 term_index = (term_index + 1) % terms.len();
                 term
             };
+            let key =
+                watch_repo.map_or_else(|| term.to_owned(), |repo| format!("watch:{repo}:{term}"));
             let progress = self.cache.progress.entry(self.forge).or_default();
             let task = if recent {
                 SearchPage::default()
             } else {
                 progress
                     .terms
-                    .get(term)
+                    .get(&key)
                     .and_then(|queue| queue.last())
                     .cloned()
                     .unwrap_or_default()
             };
-            let mut base = search(self.forge, term, 1, task.range);
+            let mut base = match watch_repo {
+                Some(repo) => codeberg_repo_search(repo, term),
+                None => search(self.forge, term, 1, task.range),
+            };
             if recent {
                 base = recent_search(self.forge, base, today.saturating_sub(7));
             }
+            let authenticated_codeberg =
+                self.forge == Forge::Codeberg && token.is_some() && !watching;
+            if authenticated_codeberg {
+                set_query_pair(&mut base, "limit", if recent { "1" } else { "2" });
+            }
             let url = match &task.next_url {
                 Some(raw) if self.forge == Forge::GitLab => gitlab_history_url(&base, raw)?,
+                Some(raw) if self.forge == Forge::Codeberg && !watching => {
+                    codeberg_history_url(&base, raw)?
+                }
                 Some(raw) => checked_page_url(&base, raw)?,
                 None => base.clone(),
             };
-            let (mut value, headers) = self
-                .get(url.clone(), token.as_deref())?
-                .context("site-wide issue search endpoint unavailable")?;
+            let result = self.get(url.clone(), if watching { None } else { token.as_deref() });
+            let (mut value, headers) = match result {
+                Ok(Some(page)) => page,
+                result
+                    if self.forge == Forge::Codeberg
+                        && !watching
+                        && global_unavailable(&result) =>
+                {
+                    watchlist = storage::codeberg_watchlist(root)?;
+                    let reason = match result {
+                        Err(error) => error.to_string(),
+                        _ => "global endpoint unavailable".into(),
+                    };
+                    ensure!(
+                        !watchlist.is_empty(),
+                        "Codeberg global search unavailable ({reason}); no codeberg-watchlist.txt entries"
+                    );
+                    watch_reason = Some(reason);
+                    continue;
+                }
+                Ok(None) if watching => {
+                    self.cache
+                        .progress
+                        .entry(self.forge)
+                        .or_default()
+                        .next_watch = watch_index;
+                    continue;
+                }
+                result => result?.context("issue search endpoint unavailable")?,
+            };
             let mut split = None;
             let mut capped = false;
             let items = if self.forge == Forge::GitHub {
@@ -424,12 +484,17 @@ impl Session<'_> {
             let mut page_counts = DiscoveryCounts::default();
             let candidates =
                 decode_page(self.forge, items, &seen, &mut page_seen, &mut page_counts);
-            if self.forge == Forge::GitLab {
+            if self.forge == Forge::GitLab || authenticated_codeberg {
+                let limit = if authenticated_codeberg {
+                    CODEBERG_AUTH_PUBLIC_CHECKS
+                } else {
+                    GITLAB_PUBLIC_CHECKS
+                };
                 let payable = candidates
                     .iter()
                     .filter(|issue| issue.reward.is_some())
                     .count();
-                if public_checks + payable > GITLAB_PUBLIC_CHECKS {
+                if public_checks + payable > limit {
                     break;
                 }
                 for issue in candidates
@@ -476,11 +541,15 @@ impl Session<'_> {
             if recent {
                 progress.next_recent = recent_index;
             } else {
-                progress.next_term = term_index;
-                if task.range.is_none() && task.next_url.is_none() {
-                    progress.blocked_ranges.remove(term);
+                if watching {
+                    progress.next_watch = watch_index;
+                } else {
+                    progress.next_term = term_index;
                 }
-                let queue = progress.terms.entry(term.into()).or_default();
+                if task.range.is_none() && task.next_url.is_none() {
+                    progress.blocked_ranges.remove(&key);
+                }
+                let queue = progress.terms.entry(key.clone()).or_default();
                 queue.pop();
                 if let Some(ranges) = split {
                     queue.extend(ranges.into_iter().map(|range| SearchPage {
@@ -494,9 +563,9 @@ impl Session<'_> {
                     });
                 }
                 if capped {
-                    progress.blocked_ranges.insert(term.into(), true);
+                    progress.blocked_ranges.insert(key, true);
                 }
-                if queue.is_empty() {
+                if !watching && queue.is_empty() {
                     completed.insert(term);
                 }
             }
@@ -512,7 +581,9 @@ impl Session<'_> {
 
         let progress = self.cache.progress.entry(self.forge).or_default();
         let mut reasons = Vec::new();
-        if completed.len() != terms.len() {
+        if watch_reason.is_some() {
+            reasons.push("Codeberg global search unavailable; watchlist only");
+        } else if completed.len() != terms.len() {
             reasons.push("continuation saved for the next cycle");
         }
         if incomplete {
@@ -526,7 +597,12 @@ impl Session<'_> {
         } else {
             format!(" (partial coverage: {})", reasons.join(", "))
         };
-        Ok(format!("Site-wide search · {counts}{coverage}"))
+        let mode = if let Some(reason) = watch_reason {
+            format!("Watchlist fallback ({reason})")
+        } else {
+            "Site-wide search".into()
+        };
+        Ok(format!("{mode} · {counts}{coverage}"))
     }
 }
 
@@ -630,6 +706,72 @@ fn gitlab_history_url(base: &Url, raw: &str) -> Result<Url> {
     Ok(url)
 }
 
+fn codeberg_repo_search(repo: &str, term: &str) -> Url {
+    let (owner, repo) = repo
+        .split_once('/')
+        .expect("validated Codeberg watchlist path");
+    let mut url = api(Forge::Codeberg, &["repos", owner, repo, "issues"]);
+    url.query_pairs_mut()
+        .append_pair("page", "1")
+        .append_pair("limit", &PAGE.to_string())
+        .append_pair("q", term)
+        .append_pair("state", "open")
+        .append_pair("type", "issues");
+    url
+}
+
+fn codeberg_history_url(base: &Url, raw: &str) -> Result<Url> {
+    if let Ok(url) = checked_page_url(base, raw) {
+        return Ok(url);
+    }
+    let target = base.join(raw)?;
+    let old_limit = target
+        .query_pairs()
+        .find(|(key, _)| key == "limit")
+        .and_then(|(_, value)| value.parse::<usize>().ok())
+        .filter(|limit| [PAGE, 2].contains(limit))
+        .context("invalid Codeberg page size")?;
+    let mut old_base = base.clone();
+    set_query_pair(&mut old_base, "limit", &old_limit.to_string());
+    let old = checked_page_url(&old_base, raw)?;
+    let offset = page_number(&old)?
+        .checked_sub(1)
+        .and_then(|page| page.checked_mul(old_limit))
+        .context("invalid Codeberg offset")?;
+    let new_limit: usize = base
+        .query_pairs()
+        .find(|(key, _)| key == "limit")
+        .context("missing Codeberg page size")?
+        .1
+        .parse()?;
+    ensure!(new_limit > 0, "invalid Codeberg page size");
+    let page = (offset / new_limit)
+        .checked_add(1)
+        .context("Codeberg page overflow")?;
+    let mut url = base.clone();
+    set_query_pair(&mut url, "page", &page.to_string());
+    Ok(url)
+}
+
+fn global_unavailable(result: &Result<Option<(Value, HeaderMap)>>) -> bool {
+    match result {
+        Ok(None) => true,
+        Err(error) => error
+            .downcast_ref::<reqwest::Error>()
+            .and_then(reqwest::Error::status)
+            .is_some_and(|status| {
+                status.is_server_error()
+                    || matches!(
+                        status,
+                        StatusCode::BAD_REQUEST
+                            | StatusCode::FORBIDDEN
+                            | StatusCode::METHOD_NOT_ALLOWED
+                    )
+            }),
+        _ => false,
+    }
+}
+
 fn recent_search(forge: Forge, mut url: Url, since: u64) -> Url {
     match forge {
         Forge::GitHub => {
@@ -709,12 +851,17 @@ fn next_page(forge: Forge, base: &Url, current: &Url, headers: &HeaderMap) -> Re
             }
         }
     }
+    let limit = base
+        .query_pairs()
+        .find(|(key, _)| key == "limit")
+        .and_then(|(_, value)| value.parse::<usize>().ok())
+        .unwrap_or(PAGE);
     if forge == Forge::Codeberg
         && headers
             .get("x-total-count")
             .and_then(|value| value.to_str().ok())
             .and_then(|value| value.parse::<usize>().ok())
-            .is_some_and(|total| total > current_page.saturating_mul(PAGE))
+            .is_some_and(|total| total > current_page.saturating_mul(limit))
     {
         let page = current_page
             .checked_add(1)
@@ -881,11 +1028,21 @@ fn run_forge(
         forge,
         commit: &commit,
     };
-    let checks = session.recheck();
+    let codeberg_token = if forge == Forge::Codeberg {
+        storage::credential("CODEBERG_TOKEN")
+    } else {
+        Ok(None)
+    };
+    let recheck_limit = if matches!(&codeberg_token, Ok(Some(_))) {
+        CODEBERG_AUTH_RECHECKS
+    } else {
+        CHECKS
+    };
+    let checks = session.recheck(recheck_limit);
     let discovery = if session.cache.status[&forge].retry_at > model::now() {
         Err(anyhow!("discovery deferred by cooldown"))
     } else {
-        session.discover()
+        codeberg_token.and_then(|token| session.discover(root, token.as_deref()))
     };
     let mut failed = false;
     let mut message = match discovery {
@@ -908,6 +1065,26 @@ fn run_forge(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn codeberg_watchlist_and_auth_resize_keep_public_scope_and_offset() {
+        let scoped = codeberg_repo_search("owner/project", "bounty");
+        assert_eq!(scoped.path(), "/api/v1/repos/owner/project/issues");
+        assert!(
+            scoped
+                .query_pairs()
+                .any(|(k, v)| k == "state" && v == "open")
+        );
+        let old = search(Forge::Codeberg, "bounty", 3, None);
+        let mut new = search(Forge::Codeberg, "bounty", 1, None);
+        set_query_pair(&mut new, "limit", "2");
+        assert_eq!(
+            page_number(&codeberg_history_url(&new, old.as_str()).unwrap()).unwrap(),
+            21
+        );
+        assert!(global_unavailable(&Ok(None)));
+        assert!(!global_unavailable(&Err(anyhow!("provider cooldown"))));
+    }
 
     #[test]
     fn targeted_github_queries_keep_public_issue_scope() {

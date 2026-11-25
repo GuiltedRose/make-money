@@ -29,7 +29,7 @@ BOUNTY_HOME="$scratch" target/release/forge-bounties --status
 BOUNTY_HOME="$scratch" target/release/forge-bounties
 ```
 
-Check each forge's status for successful site-wide searches. A Codeberg HTTP 500 indicates the global API request failed. Wait for any reported cooldown before retrying. Verify that a returned bounty has reward evidence and a working source link, then reopen the GUI with networking disabled and check that the cached bounty still loads.
+Check each forge's status for successful site-wide searches. If Codeberg falls back to watched repositories, its status reports limited coverage. Wait for any reported cooldown before retrying. Verify that a returned bounty has reward evidence and a working source link, then reopen the GUI with networking disabled and check that the cached bounty still loads.
 
 ## Activate
 
@@ -50,13 +50,15 @@ sed "s|^Exec=.*|Exec=\"$HOME/.local/bin/forge-bounties\"|" ops/forge-bounties.de
 "$HOME/.local/bin/forge-bounties"
 ```
 
-Create a GitLab.com personal access token with the `read_api` scope and supply it as `GITLAB_TOKEN`. The app uses it for instance-wide search and fetches the public issue separately without credentials. GitHub optionally accepts `GITHUB_TOKEN` for public search. Codeberg uses anonymous global search. The GUI and timer both read the GitLab token from `~/.config/forge-bounties/credentials.env` with mode 600, one `GITLAB_TOKEN=value` per line. For GitHub, set `GITHUB_TOKEN` in the launching shell or in the timer’s environment file. To create or edit the file locally:
+Create a GitLab.com personal access token with the `read_api` scope and supply it as `GITLAB_TOKEN`. The app uses it for instance-wide search and fetches the public issue separately without credentials. GitHub optionally accepts `GITHUB_TOKEN` for public search. Codeberg uses anonymous global search by default. You may set `CODEBERG_TOKEN` in the same file or environment with a public-only token limited to reading issues. Authenticated candidates are checked anonymously before caching. Those checks share Codeberg’s existing request budget. The GUI and timer both read the GitLab token from `~/.config/forge-bounties/credentials.env` with mode 600, one `GITLAB_TOKEN=value` per line. For GitHub, set `GITHUB_TOKEN` in the launching shell or in the timer’s environment file. To create or edit the file locally:
 
 ```sh
 touch "$HOME/.config/forge-bounties/credentials.env"
 chmod 600 "$HOME/.config/forge-bounties/credentials.env"
 ${EDITOR:-vi} "$HOME/.config/forge-bounties/credentials.env"
 ```
+
+For Codeberg fallback, create `codeberg-watchlist.txt` in the data directory and list one public `owner/repository` per line. The fallback searches those repositories when the global endpoint is unavailable, preserves independent per-repository continuations, and never bypasses a cooldown. The worker probes site-wide search again on the next eligible cycle.
 
 Optional background refresh runs every hour with up to two minutes of jitter. To update an existing timer, reinstall the units below, reload systemd, and run `systemctl --user restart forge-bounties.timer`.
 

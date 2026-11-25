@@ -190,19 +190,24 @@ pub fn lock(root: &Path) -> Result<File> {
 }
 
 pub fn gitlab_token() -> Result<String> {
-    if let Ok(token) = std::env::var("GITLAB_TOKEN") {
+    credential("GITLAB_TOKEN")?
+        .context("Set GITLAB_TOKEN (read_api) in ~/.config/forge-bounties/credentials.env")
+}
+
+pub fn credential(name: &str) -> Result<Option<String>> {
+    if let Ok(token) = std::env::var(name) {
         if !token.trim().is_empty() {
-            return Ok(token);
+            return Ok(Some(token));
         }
     }
-    let path = std::env::home_dir()
-        .context("set GITLAB_TOKEN (read_api)")?
-        .join(".config/forge-bounties/credentials.env");
-    let missing = || format!("Set GITLAB_TOKEN (read_api) in {}", path.display());
+    let Some(home) = std::env::home_dir() else {
+        return Ok(None);
+    };
+    let path = home.join(".config/forge-bounties/credentials.env");
     let file = match File::open(&path) {
         Ok(file) => file,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            anyhow::bail!("{}", missing())
+            return Ok(None);
         }
         Err(error) => return Err(error).with_context(|| format!("read {}", path.display())),
     };
@@ -230,10 +235,11 @@ pub fn gitlab_token() -> Result<String> {
         "{} exceeds 16 KiB",
         path.display()
     );
-    contents
+    Ok(contents
         .lines()
         .rev()
-        .filter_map(|line| line.trim().strip_prefix("GITLAB_TOKEN="))
+        .filter_map(|line| line.trim().split_once('='))
+        .filter_map(|(key, value)| (key == name).then_some(value))
         .map(str::trim)
         .map(|value| {
             value
@@ -243,6 +249,56 @@ pub fn gitlab_token() -> Result<String> {
                 .unwrap_or(value)
         })
         .find(|value| !value.is_empty())
-        .map(str::to_owned)
-        .with_context(missing)
+        .map(str::to_owned))
+}
+
+pub fn codeberg_watchlist(root: &Path) -> Result<Vec<String>> {
+    use std::io::Read;
+    let file = match File::open(root.join("codeberg-watchlist.txt")) {
+        Ok(file) => file,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(e.into()),
+    };
+    let mut contents = String::new();
+    file.take(16_385).read_to_string(&mut contents)?;
+    ensure!(
+        contents.len() <= 16_384,
+        "Codeberg watchlist exceeds 16 KiB"
+    );
+    parse_watchlist(&contents)
+}
+
+fn parse_watchlist(contents: &str) -> Result<Vec<String>> {
+    let mut repos = Vec::new();
+    for (index, line) in contents.lines().enumerate() {
+        let repo = line.trim();
+        if repo.is_empty() || repo.starts_with('#') {
+            continue;
+        }
+        ensure!(
+            valid_path(repo) && repo.split('/').count() == 2,
+            "invalid Codeberg watchlist entry on line {}",
+            index + 1
+        );
+        let repo = repo.to_ascii_lowercase();
+        if !repos.contains(&repo) {
+            repos.push(repo);
+        }
+    }
+    Ok(repos)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn watchlist_validates_and_deduplicates_public_repository_paths() {
+        assert_eq!(
+            parse_watchlist("# repos\n Owner/Project \nowner/project").unwrap(),
+            ["owner/project"]
+        );
+        assert!(parse_watchlist("https://codeberg.org/owner/project").is_err());
+        assert!(parse_watchlist("owner/../project").is_err());
+    }
 }
